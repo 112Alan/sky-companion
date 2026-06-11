@@ -46,7 +46,7 @@ def load_settings():
     if not os.path.exists(SETTINGS_FILE):
         return copy.deepcopy(DEFAULT_SETTINGS)
     try:
-        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        with open(SETTINGS_FILE, "r", encoding="utf-8-sig") as f:
             return _deep_merge(DEFAULT_SETTINGS, json.load(f))
     except Exception:
         return copy.deepcopy(DEFAULT_SETTINGS)
