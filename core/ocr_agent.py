@@ -17,12 +17,14 @@ Ignore player names, friend remarks/nicknames above avatars, UI text, menus, but
 Do not return names alone.
 If no chat bubble message is visible, return EMPTY.
 Return only the chat message text itself, with no speaker name, no JSON, no labels, no quotes.
-If partly readable, return the readable Chinese message text."""
+Return the complete chat bubble sentence. Do not return only the first few characters.
+If the message looks cut off, incomplete, or only partly readable, return EMPTY and wait for a clearer frame."""
 
 SELF_ECHO_SILENCE = 2.0
-SELF_ECHO_WINDOW = 9.0
+SELF_ECHO_WINDOW = 30.0
 OCR_MIN_INTERVAL = 0.8
 ECHO_BACKOFF = 2.0
+MSG_STABLE_SECONDS = 1.4
 DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
 
 class SkyCompanionAgent:
@@ -47,6 +49,9 @@ class SkyCompanionAgent:
     self.last_ignored_text = ""
     self.pending_msg = ""
     self.pending_since = 0
+    self.candidate_msg = ""
+    self.candidate_since = 0
+    self.candidate_seen_at = 0
     self.last_empty_ocr_log = 0
     self.replied_msgs = []
 
@@ -63,6 +68,13 @@ class SkyCompanionAgent:
 
   def _clean_text(self, txt):
     return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", txt or "").strip()
+
+  def _contains_clean(self, a, b, min_len=2):
+    ca = self._clean_text(a)
+    cb = self._clean_text(b)
+    if len(ca) < min_len or len(cb) < min_len:
+      return False
+    return ca in cb or cb in ca
 
   def _ignore_remarks(self):
     names = [self.companion_name, self.user_call_name] + DEFAULT_IGNORE_REMARKS
@@ -133,9 +145,37 @@ class SkyCompanionAgent:
       if clean_new and clean_self and (clean_new in clean_self or clean_self in clean_new):
         return True
     for w in self.my_words[-4:]:
-      if w and self._same(txt, w):
+      if w and (self._same(txt, w) or self._contains_clean(txt, w)):
         return True
     return False
+
+  def _hold_candidate(self, txt):
+    """等OCR结果稳定，避免把半句话直接拿去回复。"""
+    now = time.time()
+    clean = self._clean_text(txt)
+    if not clean:
+      return
+    if self.candidate_msg and self._contains_clean(txt, self.candidate_msg):
+      old = self._clean_text(self.candidate_msg)
+      if len(clean) >= len(old):
+        self.candidate_msg = txt
+      self.candidate_seen_at = now
+      return
+    self.candidate_msg = txt
+    self.candidate_since = now
+    self.candidate_seen_at = now
+    self._log("Read: " + txt[:60])
+
+  def _take_stable_candidate(self):
+    if not self.candidate_msg:
+      return ""
+    if time.time() - self.candidate_seen_at < MSG_STABLE_SECONDS:
+      return ""
+    msg = self.candidate_msg
+    self.candidate_msg = ""
+    self.candidate_since = 0
+    self.candidate_seen_at = 0
+    return msg
 
   def _should_reply(self, txt):
     """回复闸门：不确定是玩家在说话时宁可不回。"""
@@ -290,6 +330,19 @@ class SkyCompanionAgent:
         # 刚发完消息时，画面里的聊天气泡大概率是自己的回声，先短暂静默。
         if time.time() - self.last_sent_at < SELF_ECHO_SILENCE:
           continue
+        stable_msg = self._take_stable_candidate()
+        if stable_msg:
+          if self._is_self_echo(stable_msg):
+            self._log("Echo: " + stable_msg[:60])
+            continue
+          if self._should_reply(stable_msg) and not self._seen_recently(stable_msg):
+            if time.time() - self.last_time < 3:
+              self.pending_msg = stable_msg
+              self.pending_since = time.time()
+              self._log("Hold: " + stable_msg[:60])
+            else:
+              self._send_reply(stable_msg)
+          continue
         if self.pending_msg and time.time() - self.last_time >= 3:
           msg = self.pending_msg
           self.pending_msg = ""
@@ -347,15 +400,7 @@ class SkyCompanionAgent:
         if len(clean) < 2:
           continue
 
-        # 没到冷却时间跳过
-        if time.time() - self.last_time < 3:
-          self.pending_msg = new_msg
-          self.pending_since = time.time()
-          self._log("Hold: " + new_msg[:60])
-          continue
-
-        # DeepSeek回复
-        self._send_reply(new_msg)
+        self._hold_candidate(new_msg)
       except KeyboardInterrupt:
         self._log("Bye"); break
       except Exception as e:
