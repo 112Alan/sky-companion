@@ -11,14 +11,13 @@ from openai import OpenAI
 ctrl = GameController()
 
 VISION_PROMPT = """You are reading a Sky: Children of the Light screenshot.
-Extract the newest Chinese chat bubble message.
-Read text inside chat bubbles first. If there are multiple chat bubbles, return the newest readable one.
-Ignore player names, friend remarks/nicknames above avatars, UI text, menus, buttons, system tips, subtitles, and old menu text.
-Do not return names alone.
-If no chat bubble message is visible, return EMPTY.
-Return only the chat message text itself, with no speaker name, no JSON, no labels, no quotes.
-Return the complete chat bubble sentence. Do not return only the first few characters.
-If the message looks cut off, incomplete, or only partly readable, return EMPTY and wait for a clearer frame."""
+Extract ALL clearly visible WHITE Chinese text in the screenshot.
+Return one text item per line.
+Keep short text exactly as visible.
+Include white chat bubbles and white UI text; do not decide what is chat.
+Ignore colored, gray, transparent, blurred, or unreadable text.
+Do not output JSON, speaker labels, explanations, or quotes.
+If no clear white Chinese text is visible, return EMPTY."""
 
 SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
@@ -111,46 +110,50 @@ class SkyCompanionAgent:
     return False
 
   def _parse_vision_text(self, txt):
-    """兼容纯文本、完整JSON和Gemini偶尔吐出的半截JSON。"""
+    """把视觉输出整理成多行白色文字列表。"""
     txt = (txt or "").strip()
     if not txt or txt.upper() == "EMPTY":
       return ""
     txt = re.sub(r"^```(?:json)?\s*|\s*```$", "", txt, flags=re.I | re.S).strip()
 
-    # Gemini有时会输出半截JSON。只有拿到message字段时才使用，只有speaker则当作无消息。
-    if "speaker" in txt.lower() or "message" in txt.lower() or txt.startswith("{"):
-      msg_match = re.search(r'"message"\s*:\s*"([^"\r\n}]*)', txt, re.I)
-      if msg_match:
-        msg = msg_match.group(1).strip()
-        return "" if self._is_remark_or_name(msg) else msg
-      msg_match = re.search(r"'message'\s*:\s*'([^'\r\n}]*)", txt, re.I)
-      if msg_match:
-        msg = msg_match.group(1).strip()
-        return "" if self._is_remark_or_name(msg) else msg
-      try:
-        data = json.loads(txt)
-        if isinstance(data, dict):
-          msg = (data.get("message") or data.get("text") or "").strip()
-          return "" if self._is_remark_or_name(msg) else msg
-      except Exception:
-        pass
-      return ""
-
     try:
       data = json.loads(txt)
       if isinstance(data, dict):
-        msg = (data.get("message") or data.get("text") or "").strip()
-        return "" if self._is_remark_or_name(msg) else msg
+        values = []
+        for key in ("texts", "items", "lines", "message", "text"):
+          value = data.get(key)
+          if isinstance(value, list):
+            values.extend(str(v) for v in value)
+          elif isinstance(value, str):
+            values.append(value)
+        txt = "\n".join(values)
+      elif isinstance(data, list):
+        txt = "\n".join(str(v) for v in data)
     except Exception:
       pass
-    lines = [l.strip() for l in txt.split("\n") if re.search(r"[\u4e00-\u9fff]", l)]
-    msg = "\n".join(lines).strip()
-    return "" if self._is_remark_or_name(msg) else msg
+    lines = []
+    seen = set()
+    for line in txt.split("\n"):
+      line = re.sub(r"^\s*[-*•\d.、]+", "", line).strip()
+      line = line.strip("\"'“”‘’")
+      if not re.search(r"[\u4e00-\u9fff]", line):
+        continue
+      clean = self._clean_text(line)
+      if not clean or clean in seen:
+        continue
+      seen.add(clean)
+      lines.append(line)
+      if len(lines) >= 12:
+        break
+    return "\n".join(lines).strip()
 
   def _is_self_echo(self, txt):
     """判断OCR内容是不是自己刚发出去的话。"""
     if not txt:
       return False
+    lines = [l.strip() for l in txt.split("\n") if l.strip()]
+    if len(lines) > 1:
+      return all(self._is_self_echo(line) or self._is_remark_or_name(line) for line in lines)
     if self.last_sent_text and time.time() - self.last_sent_at < SELF_ECHO_WINDOW:
       if self._same(txt, self.last_sent_text):
         return True
@@ -261,12 +264,15 @@ class SkyCompanionAgent:
     clean = self._clean_text(txt)
     if not clean:
       return True
+    is_block = "\n" in (txt or "")
     now = time.time()
     self.ignored_msgs = [(old, ts) for old, ts in self.ignored_msgs if now - ts < 25]
     for old, ts in self.ignored_msgs:
       old_clean = self._clean_text(old)
       if old_clean == clean:
         return True
+      if is_block or "\n" in (old or ""):
+        continue
       if len(clean) >= 2 and len(old_clean) >= 2 and (clean in old_clean or old_clean in clean):
         return True
     return False
@@ -298,7 +304,7 @@ class SkyCompanionAgent:
         json={"model":self.vision["model"],"messages":[{"role":"user","content":[
           {"type":"text","text":self._vision_prompt()},
           {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+b64}}
-        ]}],"max_tokens":80},
+        ]}],"max_tokens":220},
         timeout=15)
       t = r.json()["choices"][0]["message"]["content"].strip() if r.status_code==200 else ""
       if t:
@@ -321,6 +327,7 @@ class SkyCompanionAgent:
     clean = self._clean_text(txt)
     if not clean:
       return True
+    is_block = "\n" in (txt or "")
     now = time.time()
     self.replied_msgs = [(old, ts) for old, ts in self.replied_msgs if now - ts < 45]
     for old, ts in self.replied_msgs:
@@ -329,6 +336,8 @@ class SkyCompanionAgent:
         continue
       if old_clean == clean:
         return True
+      if is_block or "\n" in (old or ""):
+        continue
       # OCR often returns a half sentence after a reply, e.g. "你好" from "你好伴侣名".
       if len(clean) >= 2 and len(old_clean) >= 2 and (clean in old_clean or old_clean in clean):
         return True
@@ -351,7 +360,7 @@ class SkyCompanionAgent:
 
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
-    self._log("New: " + new_msg[:60])
+    self._log("New: " + new_msg.replace("\n", " | ")[:80])
 
     reply = self._ch(new_msg)
     self._log("DS: " + (reply[:50] if reply else "empty"))
@@ -389,15 +398,17 @@ class SkyCompanionAgent:
         "你的性格提示词：" + self.personality_prompt + "\n"
         "长期记忆：\n" + memory_prompt(self.memory) + "\n"
         "最近对话：\n" + self._recent_dialogue_prompt() + "\n"
-        "你要先判断当前这句需不需要回复，不要每句都硬回。\n"
+        "下面给你的是当前屏幕上识别到的白色中文字列表，里面可能混着聊天、UI、活动标题、物品名、玩家备注、你自己刚说过的话。\n"
+        "你要先从列表里判断有没有“玩家最新对你说的话”。如果没有，就输出 EMPTY。\n"
         "只有当玩家在跟你打招呼、问你、喊你、接你的话、给你指令、或上下文自然需要回应时才回复。\n"
         "玩家表达情绪、吐槽、抱怨、调侃时也要自然接一句，比如“我服”“别狂了”“笑死”。\n"
-        "如果只是系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、或不需要接话，输出 EMPTY。\n"
+        "忽略系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、以及不需要接话的文字。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"
         "不要每句都喊玩家称呼，只有自然时才喊。\n"
         "如果要回复，用中文，6-18个字，像真人朋友，短一点。\n"
+        "只输出回复正文或 EMPTY，不要解释你的判断。\n"
         "你刚说过的话只用于识别回声，不要继续复读：" + recent + "\n"
-        "当前玩家文字：" + txt
+        "屏幕白色文字列表：\n" + txt
       )
       r = self.dclient.chat.completions.create(model=self.chat["model"],messages=[{"role":"user","content":p}],temperature=0.9,max_tokens=60)
       ans = r.choices[0].message.content.strip() if r.choices else ""
@@ -429,7 +440,7 @@ class SkyCompanionAgent:
             continue
           if self._ignored_recently(stable_msg):
             continue
-          if self._should_reply(stable_msg) and not self._seen_recently(stable_msg):
+          if not self._seen_recently(stable_msg):
             if time.time() - self.last_time < REPLY_COOLDOWN:
               self.pending_msg = stable_msg
               self.pending_since = time.time()
@@ -442,7 +453,7 @@ class SkyCompanionAgent:
         if self.pending_msg and time.time() - self.last_time >= REPLY_COOLDOWN:
           msg = self.pending_msg
           self.pending_msg = ""
-          if not self._seen_recently(msg) and self._should_reply(msg):
+          if not self._seen_recently(msg):
             self._send_reply(msg)
           continue
         if time.time() < self.next_ocr_at:
@@ -475,28 +486,7 @@ class SkyCompanionAgent:
           self.next_ocr_at = max(self.next_ocr_at, self.echo_backoff_until)
           continue
 
-        if not self._should_reply(new_msg):
-          self._log("Skip: " + new_msg[:60])
-          self._mark_seen(new_msg, replied=False)
-          continue
-
         if self._seen_recently(new_msg):
-          continue
-
-        # 排除自己刚说的话（字符重叠率>50%就算重复）
-        for w in self.my_words[-4:]:
-          if w and len(w) > 5:
-            common = sum(1 for c in w if c in new_msg)
-            if common / max(len(w), 1) > 0.5:
-              # 从new_msg中移除重叠部分
-              for c in w:
-                if c in new_msg:
-                  new_msg = new_msg.replace(c, "", 1)
-              new_msg = new_msg.strip()
-        if not new_msg: continue
-        # 去掉标点符号
-        clean = re.sub(r"[\s.。，,！!？?~～、]", "", new_msg).strip()
-        if len(clean) < 2:
           continue
 
         self._hold_candidate(new_msg)
