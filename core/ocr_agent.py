@@ -66,6 +66,7 @@ class SkyCompanionAgent:
     self.last_empty_ocr_log = 0
     self.replied_msgs = []
     self.ignored_msgs = []
+    self.scanned_msgs = []
     self.dialogue_turns = []
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
@@ -281,6 +282,41 @@ class SkyCompanionAgent:
       best = self._clean_text(txt)
     return re.sub(r"(吗|呢|啊|呀|吧|嘛|哈)+$", "", best)
 
+  def _similar_key(self, a, b):
+    a = self._clean_text(a)
+    b = self._clean_text(b)
+    if not a or not b:
+      return False
+    if a == b:
+      return True
+    if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
+      return True
+    sa = set(re.findall(r"[\u4e00-\u9fff]", a))
+    sb = set(re.findall(r"[\u4e00-\u9fff]", b))
+    if not sa or not sb:
+      return False
+    overlap = len(sa & sb) / max(len(sa), len(sb))
+    return overlap >= 0.75 and abs(len(a) - len(b)) <= 3
+
+  def _scanned_recently(self, txt):
+    key = self._conversation_key(txt)
+    if not key:
+      return True
+    now = time.time()
+    self.scanned_msgs = [(old, ts) for old, ts in self.scanned_msgs if now - ts < 18]
+    for old, ts in self.scanned_msgs:
+      if self._similar_key(key, old):
+        return True
+    return False
+
+  def _mark_scanned(self, txt):
+    key = self._conversation_key(txt)
+    if not key:
+      return
+    self.scanned_msgs.append((key, time.time()))
+    if len(self.scanned_msgs) > 40:
+      self.scanned_msgs = self.scanned_msgs[-40:]
+
   def _remember_turn(self, player, reply=""):
     if not player:
       return
@@ -297,11 +333,7 @@ class SkyCompanionAgent:
     self.ignored_msgs = [(old, ts) for old, ts in self.ignored_msgs if now - ts < 25]
     for old, ts in self.ignored_msgs:
       old_clean = self._clean_text(old)
-      if old_clean == clean:
-        return True
-      if is_block or "\n" in (old or ""):
-        continue
-      if len(clean) >= 2 and len(old_clean) >= 2 and (clean in old_clean or old_clean in clean):
+      if self._similar_key(clean, old_clean):
         return True
     return False
 
@@ -362,12 +394,7 @@ class SkyCompanionAgent:
       old_clean = self._clean_text(old)
       if not old_clean:
         continue
-      if old_clean == clean:
-        return True
-      if is_block or "\n" in (old or ""):
-        continue
-      # OCR often returns a half sentence after a reply, e.g. "你好" from "你好伴侣名".
-      if len(clean) >= 2 and len(old_clean) >= 2 and (clean in old_clean or old_clean in clean):
+      if self._similar_key(clean, old_clean):
         return True
     return False
 
@@ -380,6 +407,7 @@ class SkyCompanionAgent:
       self.replied_msgs.append((key, time.time()))
     else:
       self.ignored_msgs.append((key, time.time()))
+    self._mark_scanned(key)
     if len(self.seen) > 50:
       self.seen = self.seen[-50:]
     if len(self.replied_msgs) > 30:
@@ -523,6 +551,10 @@ class SkyCompanionAgent:
         if self._seen_recently(new_msg):
           continue
 
+        if self._scanned_recently(new_msg):
+          continue
+
+        self._mark_scanned(new_msg)
         self._hold_candidate(new_msg)
         self.next_ocr_at = max(self.next_ocr_at, time.time() + MSG_STABLE_SECONDS)
       except KeyboardInterrupt:
