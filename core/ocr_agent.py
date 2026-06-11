@@ -30,11 +30,13 @@ DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
 UI_TEXT_HINTS = [
   "狂欢", "狂欢季", "季节", "先祖", "编钟", "任务", "活动", "礼包", "商店", "蜡烛",
   "爱心", "斗篷", "发型", "面具", "乐器", "兑换", "领取", "剩余", "点击",
+  "好友解除", "已经与此好友解除",
 ]
+UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故"]
 CHAT_HINTS = [
   "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "走", "来", "去",
   "你", "我", "咱", "我们", "怎么", "为什么", "什么", "哪", "喊", "吗", "呢",
-  "别", "服", "烦", "笑死", "草", "靠", "无语", "救命", "行", "好",
+  "谁", "咋", "干嘛", "会什么", "不去", "别", "服", "烦", "笑死", "草", "靠", "无语", "救命", "行", "好",
   "？", "?", "！", "!",
 ]
 
@@ -229,6 +231,10 @@ class SkyCompanionAgent:
     clean = self._clean_text(txt)
     if not clean:
       return True
+    if clean in UI_EXACT_TEXTS:
+      return True
+    if len(clean) <= 3 and (clean.startswith("现在") or clean.startswith("狂")):
+      return True
     has_chat_hint = any(h in txt for h in CHAT_HINTS)
     for hint in UI_TEXT_HINTS:
       if hint in clean and not has_chat_hint:
@@ -272,6 +278,32 @@ class SkyCompanionAgent:
         continue
       kept.append(line)
     return "\n".join(kept)
+
+  def _is_known_line(self, line):
+    key = self._conversation_key(line)
+    if not key:
+      return True
+    now = time.time()
+    self.replied_msgs = [(old, ts) for old, ts in self.replied_msgs if now - ts < 45]
+    self.ignored_msgs = [(old, ts) for old, ts in self.ignored_msgs if now - ts < 25]
+    self.scanned_msgs = [(old, ts) for old, ts in self.scanned_msgs if now - ts < 18]
+    for pool in (self.replied_msgs, self.ignored_msgs, self.scanned_msgs):
+      for old, ts in pool:
+        if self._similar_key(key, old):
+          return True
+    return False
+
+  def _fresh_screen_text(self, txt):
+    """只保留当前白字列表里还没处理过的新行。"""
+    fresh = []
+    for line in self._filter_screen_text(txt).split("\n"):
+      line = line.strip()
+      if not line:
+        continue
+      if self._is_known_line(line):
+        continue
+      fresh.append(line)
+    return "\n".join(fresh)
 
   def _conversation_key(self, txt):
     filtered = self._filter_screen_text(txt)
@@ -536,6 +568,10 @@ class SkyCompanionAgent:
         new_msg = self._parse_vision_text(now)
         if not new_msg:
           continue
+        fresh_msg = self._fresh_screen_text(new_msg)
+        if not fresh_msg:
+          continue
+        new_msg = fresh_msg
 
         if self._ignored_recently(new_msg):
           continue
