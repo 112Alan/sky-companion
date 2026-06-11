@@ -253,6 +253,34 @@ class SkyCompanionAgent:
       lines.append(self.companion_name + "：" + (reply if reply else "（没有回复）"))
     return "\n".join(lines)
 
+  def _filter_screen_text(self, txt):
+    """去掉明显UI行，保留可能是玩家说话的白字。"""
+    kept = []
+    for line in (txt or "").split("\n"):
+      line = line.strip()
+      if not line:
+        continue
+      clean = self._clean_text(line)
+      if not clean:
+        continue
+      if self._is_remark_or_name(line):
+        continue
+      if self._is_self_echo(line):
+        continue
+      if self._looks_like_ui_text(line) and not self._looks_like_chat(line):
+        continue
+      kept.append(line)
+    return "\n".join(kept)
+
+  def _conversation_key(self, txt):
+    filtered = self._filter_screen_text(txt)
+    lines = [self._clean_text(l) for l in filtered.split("\n") if self._clean_text(l)]
+    if lines:
+      best = max(lines, key=len)
+    else:
+      best = self._clean_text(txt)
+    return re.sub(r"(吗|呢|啊|呀|吧|嘛|哈)+$", "", best)
+
   def _remember_turn(self, player, reply=""):
     if not player:
       return
@@ -261,7 +289,7 @@ class SkyCompanionAgent:
       self.dialogue_turns = self.dialogue_turns[-20:]
 
   def _ignored_recently(self, txt):
-    clean = self._clean_text(txt)
+    clean = self._conversation_key(txt)
     if not clean:
       return True
     is_block = "\n" in (txt or "")
@@ -324,7 +352,7 @@ class SkyCompanionAgent:
     return "\n".join(diff) if diff else ""
 
   def _seen_recently(self, txt):
-    clean = self._clean_text(txt)
+    clean = self._conversation_key(txt)
     if not clean:
       return True
     is_block = "\n" in (txt or "")
@@ -346,11 +374,12 @@ class SkyCompanionAgent:
   def _mark_seen(self, txt, replied=True):
     if not txt:
       return
-    self.seen.append(txt)
+    key = self._conversation_key(txt)
+    self.seen.append(key)
     if replied:
-      self.replied_msgs.append((txt, time.time()))
+      self.replied_msgs.append((key, time.time()))
     else:
-      self.ignored_msgs.append((txt, time.time()))
+      self.ignored_msgs.append((key, time.time()))
     if len(self.seen) > 50:
       self.seen = self.seen[-50:]
     if len(self.replied_msgs) > 30:
@@ -360,14 +389,19 @@ class SkyCompanionAgent:
 
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
-    self._log("New: " + new_msg.replace("\n", " | ")[:80])
+    filtered_msg = self._filter_screen_text(new_msg)
+    if not filtered_msg:
+      self._log("Skip: " + new_msg.replace("\n", " | ")[:80])
+      self._mark_seen(new_msg, replied=False)
+      return False
+    self._log("New: " + filtered_msg.replace("\n", " | ")[:80])
 
-    reply = self._ch(new_msg)
+    reply = self._ch(filtered_msg)
     self._log("DS: " + (reply[:50] if reply else "empty"))
     if not reply:
       self._log("Decide: no reply")
-      self._mark_seen(new_msg, replied=False)
-      self._remember_turn(new_msg, "")
+      self._mark_seen(filtered_msg, replied=False)
+      self._remember_turn(filtered_msg, "")
       return False
     reply = reply.strip().strip("\"\'")
     if len(reply) < 2:
@@ -379,9 +413,9 @@ class SkyCompanionAgent:
     self.my_words.append(reply)
     self.last_sent_text = reply
     self.last_sent_at = time.time()
-    self._mark_seen(new_msg, replied=True)
-    self.memory = add_memory(new_msg, reply)
-    self._remember_turn(new_msg, reply)
+    self._mark_seen(filtered_msg, replied=True)
+    self.memory = add_memory(filtered_msg, reply)
+    self._remember_turn(filtered_msg, reply)
     if len(self.my_words) > 8: self.my_words.pop(0)
     self.last_time = time.time()
     self.skip = 3
