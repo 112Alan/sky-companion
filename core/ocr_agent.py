@@ -157,8 +157,9 @@ class SkyCompanionAgent:
       return
     if self.candidate_msg and self._contains_clean(txt, self.candidate_msg):
       old = self._clean_text(self.candidate_msg)
-      if len(clean) >= len(old):
+      if len(clean) > len(old):
         self.candidate_msg = txt
+        self.candidate_since = now
       self.candidate_seen_at = now
       return
     self.candidate_msg = txt
@@ -169,7 +170,7 @@ class SkyCompanionAgent:
   def _take_stable_candidate(self):
     if not self.candidate_msg:
       return ""
-    if time.time() - self.candidate_seen_at < MSG_STABLE_SECONDS:
+    if time.time() - self.candidate_since < MSG_STABLE_SECONDS:
       return ""
     msg = self.candidate_msg
     self.candidate_msg = ""
