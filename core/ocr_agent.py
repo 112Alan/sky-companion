@@ -36,7 +36,8 @@ UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故"]
 CHAT_HINTS = [
   "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "走", "来", "去",
   "你", "我", "咱", "我们", "怎么", "为什么", "什么", "哪", "喊", "吗", "呢",
-  "谁", "咋", "干嘛", "会什么", "不去", "别", "服", "烦", "笑死", "草", "靠", "无语", "救命", "行", "好",
+  "谁", "咋", "干嘛", "会什么", "不去", "说话", "回话", "理我", "不说话", "哑巴",
+  "别", "服", "烦", "笑死", "草", "靠", "无语", "救命", "行", "好",
   "？", "?", "！", "!",
 ]
 
@@ -314,6 +315,19 @@ class SkyCompanionAgent:
       best = self._clean_text(txt)
     return re.sub(r"(吗|呢|啊|呀|吧|嘛|哈)+$", "", best)
 
+  def _is_too_fragmentary(self, txt):
+    filtered = self._filter_screen_text(txt)
+    lines = [self._clean_text(l) for l in filtered.split("\n") if self._clean_text(l)]
+    if not lines:
+      return True
+    if len(lines) == 1:
+      clean = lines[0]
+      if len(clean) <= 1:
+        return True
+      if clean in ("你", "我", "他", "她", "它", "们", "我们", "你们", "现在"):
+        return True
+    return False
+
   def _similar_key(self, a, b):
     a = self._clean_text(a)
     b = self._clean_text(b)
@@ -450,7 +464,7 @@ class SkyCompanionAgent:
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
     filtered_msg = self._filter_screen_text(new_msg)
-    if not filtered_msg:
+    if not filtered_msg or self._is_too_fragmentary(filtered_msg):
       self._log("Skip: " + new_msg.replace("\n", " | ")[:80])
       self._mark_seen(new_msg, replied=False)
       return False
@@ -495,6 +509,7 @@ class SkyCompanionAgent:
         "下面给你的是当前屏幕上识别到的白色中文字列表，里面可能混着聊天、UI、活动标题、物品名、玩家备注、你自己刚说过的话。\n"
         "你要先从列表里判断有没有“玩家最新对你说的话”。如果没有，就输出 EMPTY。\n"
         "只有当玩家在跟你打招呼、问你、喊你、接你的话、给你指令、或上下文自然需要回应时才回复。\n"
+        "玩家催你说话、问你在不在、说你不说话/哑巴了吗/理我/回话时，一定要自然回应。\n"
         "玩家表达情绪、吐槽、抱怨、调侃时也要自然接一句，比如“我服”“别狂了”“笑死”。\n"
         "忽略系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、以及不需要接话的文字。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"
@@ -588,6 +603,11 @@ class SkyCompanionAgent:
           continue
 
         if self._scanned_recently(new_msg):
+          continue
+
+        if self._is_too_fragmentary(new_msg):
+          self._log("Skip: " + new_msg.replace("\n", " | ")[:80])
+          self._mark_seen(new_msg, replied=False)
           continue
 
         self._mark_scanned(new_msg)
