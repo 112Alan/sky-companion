@@ -1,0 +1,25 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# 截图输出
+outputs/screenshots/
+user_data/
+*.png
+*.jpg
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 虚拟环境
+venv/
+.env
+
+# 系统
+Thumbs.db
+.DS_Store
