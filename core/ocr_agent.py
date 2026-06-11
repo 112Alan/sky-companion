@@ -22,10 +22,21 @@ If the message looks cut off, incomplete, or only partly readable, return EMPTY 
 
 SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
-OCR_MIN_INTERVAL = 0.8
+OCR_MIN_INTERVAL = 0.6
 ECHO_BACKOFF = 2.0
-MSG_STABLE_SECONDS = 1.4
+MSG_STABLE_SECONDS = 0.9
+REPLY_COOLDOWN = 1.2
+CHANGE_THRESHOLD = 10
 DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
+UI_TEXT_HINTS = [
+  "狂欢", "狂欢季", "季节", "先祖", "编钟", "任务", "活动", "礼包", "商店", "蜡烛",
+  "爱心", "斗篷", "发型", "面具", "乐器", "兑换", "领取", "剩余", "点击",
+]
+CHAT_HINTS = [
+  "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "走", "来", "去",
+  "你", "我", "咱", "我们", "怎么", "为什么", "什么", "哪", "喊", "吗", "呢",
+  "？", "?", "！", "!",
+]
 
 class SkyCompanionAgent:
   def __init__(self, settings=None):
@@ -54,6 +65,8 @@ class SkyCompanionAgent:
     self.candidate_seen_at = 0
     self.last_empty_ocr_log = 0
     self.replied_msgs = []
+    self.ignored_msgs = []
+    self.dialogue_turns = []
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
 
@@ -184,6 +197,10 @@ class SkyCompanionAgent:
     clean = self._clean_text(txt)
     if len(clean) < 2:
       return False
+    if self._looks_incomplete(txt):
+      return False
+    if self._looks_like_ui_text(txt):
+      return False
     if self._is_remark_or_name(txt):
       return False
     if self._is_self_echo(txt):
@@ -193,12 +210,72 @@ class SkyCompanionAgent:
       return False
     return True
 
+  def _looks_incomplete(self, txt):
+    clean = self._clean_text(txt)
+    if not clean:
+      return True
+    if len(clean) <= 6 and clean[-1] in "的了着在把被给和跟又该新":
+      return True
+    if clean in ("什么", "怎么", "你该", "怎么又"):
+      return True
+    return False
+
+  def _looks_like_ui_text(self, txt):
+    clean = self._clean_text(txt)
+    if not clean:
+      return True
+    has_chat_hint = any(h in txt for h in CHAT_HINTS)
+    for hint in UI_TEXT_HINTS:
+      if hint in clean and not has_chat_hint:
+        return True
+    return False
+
+  def _looks_like_chat(self, txt):
+    clean = self._clean_text(txt)
+    if len(clean) < 2:
+      return False
+    if any(h in txt for h in CHAT_HINTS):
+      return True
+    # 稍长的句子没有明显UI词时，先当作可能的人话。
+    return len(clean) >= 7
+
+  def _recent_dialogue_prompt(self):
+    if not self.dialogue_turns:
+      return "暂无。"
+    lines = []
+    for item in self.dialogue_turns[-8:]:
+      lines.append("玩家：" + item.get("player", ""))
+      reply = item.get("reply", "")
+      lines.append(self.companion_name + "：" + (reply if reply else "（没有回复）"))
+    return "\n".join(lines)
+
+  def _remember_turn(self, player, reply=""):
+    if not player:
+      return
+    self.dialogue_turns.append({"player": player[:80], "reply": reply[:80]})
+    if len(self.dialogue_turns) > 20:
+      self.dialogue_turns = self.dialogue_turns[-20:]
+
+  def _ignored_recently(self, txt):
+    clean = self._clean_text(txt)
+    if not clean:
+      return True
+    now = time.time()
+    self.ignored_msgs = [(old, ts) for old, ts in self.ignored_msgs if now - ts < 25]
+    for old, ts in self.ignored_msgs:
+      old_clean = self._clean_text(old)
+      if old_clean == clean:
+        return True
+      if len(clean) >= 2 and len(old_clean) >= 2 and (clean in old_clean or old_clean in clean):
+        return True
+    return False
+
   def _changed(self, shot):
     arr = np.array(shot)
     if self.prev is not None and arr.shape == self.prev.shape:
       diff = np.mean(np.abs(arr - self.prev))
       self.prev = arr.copy()
-      return diff > 15
+      return diff > CHANGE_THRESHOLD
     self.prev = arr.copy(); return True
 
   def _vision_prompt(self):
@@ -256,15 +333,20 @@ class SkyCompanionAgent:
         return True
     return False
 
-  def _mark_seen(self, txt):
+  def _mark_seen(self, txt, replied=True):
     if not txt:
       return
     self.seen.append(txt)
-    self.replied_msgs.append((txt, time.time()))
+    if replied:
+      self.replied_msgs.append((txt, time.time()))
+    else:
+      self.ignored_msgs.append((txt, time.time()))
     if len(self.seen) > 50:
       self.seen = self.seen[-50:]
     if len(self.replied_msgs) > 30:
       self.replied_msgs = self.replied_msgs[-30:]
+    if len(self.ignored_msgs) > 30:
+      self.ignored_msgs = self.ignored_msgs[-30:]
 
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
@@ -273,6 +355,9 @@ class SkyCompanionAgent:
     reply = self._ch(new_msg)
     self._log("DS: " + (reply[:50] if reply else "empty"))
     if not reply:
+      self._log("Decide: no reply")
+      self._mark_seen(new_msg, replied=False)
+      self._remember_turn(new_msg, "")
       return False
     reply = reply.strip().strip("\"\'")
     if len(reply) < 2:
@@ -284,8 +369,9 @@ class SkyCompanionAgent:
     self.my_words.append(reply)
     self.last_sent_text = reply
     self.last_sent_at = time.time()
-    self._mark_seen(new_msg)
+    self._mark_seen(new_msg, replied=True)
     self.memory = add_memory(new_msg, reply)
+    self._remember_turn(new_msg, reply)
     if len(self.my_words) > 8: self.my_words.pop(0)
     self.last_time = time.time()
     self.skip = 3
@@ -301,12 +387,15 @@ class SkyCompanionAgent:
         "玩家在光遇里的称呼/备注名是：" + self.user_call_name + "\n"
         "你的性格提示词：" + self.personality_prompt + "\n"
         "长期记忆：\n" + memory_prompt(self.memory) + "\n"
-        "Reply in Chinese, 6-18 chars, natural and short.\n"
-        "Only answer the Player message below. Do not continue your own previous topic.\n"
-        "Do not invent facts like what you did last night.\n"
-        "If Player text is incomplete, only a name, OCR junk, or not worth replying, output EMPTY.\n"
-        "Your recent replies for echo detection, do not answer them: " + recent + "\n"
-        "Player: " + txt
+        "最近对话：\n" + self._recent_dialogue_prompt() + "\n"
+        "你要先判断当前这句需不需要回复，不要每句都硬回。\n"
+        "只有当玩家在跟你打招呼、问你、喊你、接你的话、给你指令、或上下文自然需要回应时才回复。\n"
+        "如果只是系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、或不需要接话，输出 EMPTY。\n"
+        "如果前后文看起来已经回过了，也输出 EMPTY。\n"
+        "不要每句都喊玩家称呼，只有自然时才喊。\n"
+        "如果要回复，用中文，6-18个字，像真人朋友，短一点。\n"
+        "你刚说过的话只用于识别回声，不要继续复读：" + recent + "\n"
+        "当前玩家文字：" + txt
       )
       r = self.dclient.chat.completions.create(model=self.chat["model"],messages=[{"role":"user","content":p}],temperature=0.9,max_tokens=60)
       ans = r.choices[0].message.content.strip() if r.choices else ""
@@ -336,15 +425,19 @@ class SkyCompanionAgent:
           if self._is_self_echo(stable_msg):
             self._log("Echo: " + stable_msg[:60])
             continue
+          if self._ignored_recently(stable_msg):
+            continue
           if self._should_reply(stable_msg) and not self._seen_recently(stable_msg):
-            if time.time() - self.last_time < 3:
+            if time.time() - self.last_time < REPLY_COOLDOWN:
               self.pending_msg = stable_msg
               self.pending_since = time.time()
               self._log("Hold: " + stable_msg[:60])
             else:
               self._send_reply(stable_msg)
           continue
-        if self.pending_msg and time.time() - self.last_time >= 3:
+        if self.candidate_msg:
+          continue
+        if self.pending_msg and time.time() - self.last_time >= REPLY_COOLDOWN:
           msg = self.pending_msg
           self.pending_msg = ""
           if not self._seen_recently(msg) and self._should_reply(msg):
@@ -369,6 +462,9 @@ class SkyCompanionAgent:
         if not new_msg:
           continue
 
+        if self._ignored_recently(new_msg):
+          continue
+
         if self._is_self_echo(new_msg):
           if not self._same(new_msg, self.last_ignored_text):
             self._log("Echo: " + new_msg[:60])
@@ -379,7 +475,7 @@ class SkyCompanionAgent:
 
         if not self._should_reply(new_msg):
           self._log("Skip: " + new_msg[:60])
-          self._mark_seen(new_msg)
+          self._mark_seen(new_msg, replied=False)
           continue
 
         if self._seen_recently(new_msg):
@@ -402,6 +498,7 @@ class SkyCompanionAgent:
           continue
 
         self._hold_candidate(new_msg)
+        self.next_ocr_at = max(self.next_ocr_at, time.time() + MSG_STABLE_SECONDS)
       except KeyboardInterrupt:
         self._log("Bye"); break
       except Exception as e:
