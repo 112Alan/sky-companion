@@ -118,6 +118,32 @@ user_data/settings.json
 
 程序会再次进入首次配置流程。
 
+## OCR 一直 empty 怎么办
+
+如果日志反复出现：
+
+```text
+OCR: empty
+```
+
+通常是视觉模型没有读到画面文字，优先检查：
+
+- 光遇窗口没有最小化，聊天文字在截图里清楚可见
+- PowerShell/OBS/别的窗口没有挡住光遇聊天区域
+- 视觉模型的 `base_url`、模型名、API Key 填对
+- 视觉接口必须兼容 OpenAI Chat Completions 图片输入格式
+- 光遇文字太小或太暗时，可以把游戏窗口放大一点
+
+如果出现：
+
+```text
+VHTTP: 401
+VHTTP: 403
+VHTTP: 404
+```
+
+一般分别是 Key 错、接口不允许、网址或模型不对。
+
 ## License
 
 MIT

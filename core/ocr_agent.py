@@ -11,13 +11,14 @@ from openai import OpenAI
 ctrl = GameController()
 
 VISION_PROMPT = """You are reading a Sky: Children of the Light screenshot.
-Extract ALL clearly visible WHITE Chinese text in the screenshot.
+Extract ALL clearly visible Chinese text in the screenshot, especially white text.
 Return one text item per line.
 Keep short text exactly as visible.
-Include white chat bubbles and white UI text; do not decide what is chat.
-Ignore colored, gray, transparent, blurred, or unreadable text.
+Include chat bubbles and UI text; do not decide what is chat.
+Prefer white text, but if the chat text is light gray or slightly dim, include it too.
+Ignore only unreadable text.
 Do not output JSON, speaker labels, explanations, or quotes.
-If no clear white Chinese text is visible, return EMPTY."""
+If no clear Chinese text is visible, return EMPTY."""
 
 SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
@@ -67,6 +68,7 @@ class SkyCompanionAgent:
     self.candidate_since = 0
     self.candidate_seen_at = 0
     self.last_empty_ocr_log = 0
+    self.empty_ocr_count = 0
     self.replied_msgs = []
     self.ignored_msgs = []
     self.scanned_msgs = []
@@ -400,8 +402,8 @@ class SkyCompanionAgent:
     """Gemini识图（通过hohoapi）"""
     shot = shot or capture_window()
     if not shot: return ""
-    shot = shot.resize((shot.width*3//4, shot.height*3//4))
-    buf = io.BytesIO(); shot.save(buf, format="JPEG", quality=50)
+    shot = shot.resize((shot.width*9//10, shot.height*9//10))
+    buf = io.BytesIO(); shot.save(buf, format="JPEG", quality=70)
     b64 = base64.b64encode(buf.getvalue()).decode()
     t0 = time.time()
     try:
@@ -411,8 +413,14 @@ class SkyCompanionAgent:
           {"type":"text","text":self._vision_prompt()},
           {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+b64}}
         ]}],"max_tokens":220},
-        timeout=15)
-      t = r.json()["choices"][0]["message"]["content"].strip() if r.status_code==200 else ""
+        timeout=20)
+      if r.status_code != 200:
+        self._log("VHTTP: " + str(r.status_code) + " " + r.text[:80].replace("\n", " "))
+        return ""
+      data = r.json()
+      t = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+      if t.upper() == "EMPTY":
+        return ""
       if t:
         t = self._parse_vision_text(t)
         if t: return t
@@ -575,10 +583,15 @@ class SkyCompanionAgent:
         now = self._do_ocr(shot)
         self.next_ocr_at = time.time() + OCR_MIN_INTERVAL
         if not now:
+          self.empty_ocr_count += 1
           if time.time() - self.last_empty_ocr_log > 8:
-            self._log("OCR: empty")
+            tip = "OCR: empty"
+            if self.empty_ocr_count >= 3:
+              tip += " (检查视觉key/base_url/model、光遇窗口是否可见、聊天文字是否太小/被遮挡)"
+            self._log(tip)
             self.last_empty_ocr_log = time.time()
           continue
+        self.empty_ocr_count = 0
 
         new_msg = self._parse_vision_text(now)
         if not new_msg:
