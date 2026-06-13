@@ -19,7 +19,6 @@ DEFAULT_CHAT_MODEL = "deepseek-chat"
 SKY_WINDOW_TITLES = [
     "光·遇",
     "Sky: Children of the Light",
-    "Sky",
     "光遇",
 ]
 

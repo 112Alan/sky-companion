@@ -10,10 +10,15 @@ import pyautogui
 from PIL import Image
 from config import SKY_WINDOW_TITLES, SCREENSHOT_DIR
 
+EXCLUDED_WINDOW_TITLE_HINTS = ("codex", "powershell", "github", "sky_companion", "visual studio code")
+
 def find_sky_window():
     """查找光遇游戏窗口"""
     all_windows = gw.getAllTitles()
     for title in all_windows:
+        title_l = (title or "").lower()
+        if any(hint in title_l for hint in EXCLUDED_WINDOW_TITLE_HINTS):
+            continue
         for sky_title in SKY_WINDOW_TITLES:
             if sky_title in title:
                 windows = gw.getWindowsWithTitle(title)
