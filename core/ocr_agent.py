@@ -11,14 +11,11 @@ from openai import OpenAI
 ctrl = GameController()
 
 VISION_PROMPT = """You are reading a Sky: Children of the Light screenshot.
-Extract ALL clearly visible Chinese text in the screenshot, especially white text.
-Return one text item per line.
-Keep short text exactly as visible.
-Include chat bubbles and UI text; do not decide what is chat.
-Prefer white text, but if the chat text is light gray or slightly dim, include it too.
-Ignore only unreadable text.
-Do not output JSON, speaker labels, explanations, or quotes.
-If no clear Chinese text is visible, return EMPTY."""
+Extract only player chat text from chat bubbles or the opened chat history.
+Ignore system toasts, event notices, menus, buttons, shortcut letters, sleep Z marks, player names, remarks, scenery text, and UI labels.
+Do not return season/event notices such as 狂欢季的新任务现已开启.
+Return one chat message per line, with no JSON, speaker labels, explanations, or quotes.
+If there is no clear player chat message, return EMPTY."""
 
 SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
@@ -31,15 +28,34 @@ DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
 UI_TEXT_HINTS = [
   "狂欢", "狂欢季", "季节", "先祖", "编钟", "任务", "活动", "礼包", "商店", "蜡烛",
   "爱心", "斗篷", "发型", "面具", "乐器", "兑换", "领取", "剩余", "点击",
-  "好友解除", "已经与此好友解除",
+  "好友解除", "已经与此好友解除", "现已开启", "新任务", "设置", "确定", "取消",
 ]
-UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故"]
+UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故", "接", "看", "没", "设", "君", "Z", "z"]
 CHAT_HINTS = [
   "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "走", "来", "去",
   "你", "我", "咱", "我们", "怎么", "为什么", "什么", "哪", "喊", "吗", "呢",
   "谁", "咋", "干嘛", "会什么", "不去", "说话", "回话", "理我", "不说话", "哑巴",
   "别", "服", "烦", "笑死", "草", "靠", "无语", "救命", "行", "好",
   "？", "?", "！", "!",
+]
+STRONG_CHAT_HINTS = [
+  "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "你在吗",
+  "走啊", "来吗", "去吗", "去不去", "做任务", "跑图", "说话", "回话",
+  "理我", "不说话", "哑巴", "你是谁", "你在干嘛", "你会什么",
+  "我服", "笑死", "无语", "救命", "怎么", "为什么", "干嘛", "什么",
+  "？", "?", "！", "!",
+]
+MUST_REPLY_HINTS = [
+  "你是谁", "你在吗", "在不在", "说话", "回话", "理我", "不说话", "哑巴",
+  "你在干嘛", "你会什么", "为什么", "怎么不", "扫描错", "识别错", "看错",
+]
+NON_CHAT_SUBSTRINGS = [
+  "PowerShell", "Python", "PID", "github", "GitHub", "Codex", "codex",
+  "管理员", "接管", "日志", "程序", "当前在跑", "启动成功", "测试接管",
+  "选择", "PressEnter", "baseurl", "model", "apikey", "key", "OCR",
+  "Start", "Ready", "timeout", "http", "https", "url", "v1chatcompletions",
+  "模型", "接口", "配置", "版本", "视觉", "本地", "DeepSeek", "Gemini",
+  "回复一条", "这一套", "GitHub", "截图", "识别", "中转站",
 ]
 
 class SkyCompanionAgent:
@@ -87,6 +103,75 @@ class SkyCompanionAgent:
 
   def _clean_text(self, txt):
     return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", txt or "").strip()
+
+  def _has_chat_intent(self, txt):
+    clean = self._clean_text(txt)
+    if len(clean) < 2:
+      return False
+    if any(h in txt or h in clean for h in STRONG_CHAT_HINTS):
+      return True
+    if len(clean) <= 4:
+      return False
+    weak = [h for h in CHAT_HINTS if h not in ("你", "我", "好", "来", "去", "行")]
+    if any(h in txt or h in clean for h in weak):
+      return True
+    return len(clean) >= 6
+
+  def _must_reply(self, txt):
+    clean = self._clean_text(txt)
+    return any(h in txt or h in clean for h in MUST_REPLY_HINTS)
+
+  def _fallback_reply(self, txt):
+    clean = self._clean_text(txt)
+    if "你是谁" in clean:
+      return "我是小懒呀。"
+    if "扫描错" in clean or "识别错" in clean or "看错" in clean:
+      return "可能看岔了，我再瞅瞅。"
+    if "在吗" in clean or "在不在" in clean:
+      return "在呢在呢。"
+    if "说话" in clean or "回话" in clean or "理我" in clean or "哑巴" in clean:
+      return "来了来了，刚卡了一下。"
+    if "为什么" in clean:
+      return "可能刚刚卡了。"
+    if "你会什么" in clean:
+      return "聊天跑图都能陪你。"
+    if "你在干嘛" in clean:
+      return "等你发话呢。"
+    return ""
+
+  def _is_noise_text(self, txt):
+    clean = self._clean_text(txt)
+    if not clean:
+      return True
+    if clean in UI_EXACT_TEXTS:
+      return True
+    if clean.lower() in ("z", "zz", "zzz"):
+      return True
+    if len(clean) <= 1:
+      return True
+    if any(h in clean for h in CHAT_HINTS):
+      return False
+    if any(h in clean for h in UI_TEXT_HINTS):
+      return True
+    if "任务" in clean and "开启" in clean:
+      return True
+    return False
+
+  def _looks_like_non_chat_line(self, txt):
+    raw = str(txt or "").strip()
+    clean = self._clean_text(raw)
+    if not clean:
+      return True
+    compact_clean = clean.lower()
+    for word in NON_CHAT_SUBSTRINGS:
+      key = self._clean_text(word).lower()
+      if word in raw or (key and key in compact_clean):
+        return True
+    if re.search(r"\b(pid|python|powershell|log|http|https)\b", raw, re.I):
+      return True
+    if len(clean) >= 18 and not self._has_chat_intent(raw):
+      return True
+    return False
 
   def _contains_clean(self, a, b, min_len=2):
     ca = self._clean_text(a)
@@ -145,6 +230,10 @@ class SkyCompanionAgent:
       if not re.search(r"[\u4e00-\u9fff]", line):
         continue
       clean = self._clean_text(line)
+      if self._is_noise_text(clean):
+        continue
+      if self._looks_like_non_chat_line(line):
+        continue
       if not clean or clean in seen:
         continue
       seen.add(clean)
@@ -236,6 +325,8 @@ class SkyCompanionAgent:
       return True
     if clean in UI_EXACT_TEXTS:
       return True
+    if self._is_noise_text(clean) and not any(h in txt for h in CHAT_HINTS):
+      return True
     if len(clean) <= 3 and (clean.startswith("现在") or clean.startswith("狂")):
       return True
     has_chat_hint = any(h in txt for h in CHAT_HINTS)
@@ -248,10 +339,36 @@ class SkyCompanionAgent:
     clean = self._clean_text(txt)
     if len(clean) < 2:
       return False
-    if any(h in txt for h in CHAT_HINTS):
+    if self._has_chat_intent(txt):
       return True
     # 稍长的句子没有明显UI词时，先当作可能的人话。
     return len(clean) >= 7
+
+  def _select_player_message(self, txt):
+    """从OCR多行里只取最像玩家最新发言的一句，避免把整屏说明文字丢给模型。"""
+    lines = []
+    for line in (txt or "").split("\n"):
+      line = line.strip()
+      if not line:
+        continue
+      clean = self._clean_text(line)
+      if not clean:
+        continue
+      if self._is_remark_or_name(line) or self._is_self_echo(line):
+        continue
+      if self._is_noise_text(line) or self._looks_like_non_chat_line(line):
+        continue
+      if len(clean) <= 2 and not self._has_chat_intent(line):
+        continue
+      lines.append(line)
+    if not lines:
+      return ""
+    chat_lines = [line for line in lines if self._has_chat_intent(line)]
+    if chat_lines:
+      return chat_lines[-1]
+    if len(lines) > 1:
+      return ""
+    return lines[0]
 
   def _recent_dialogue_prompt(self):
     if not self.dialogue_turns:
@@ -306,7 +423,7 @@ class SkyCompanionAgent:
       if self._is_known_line(line):
         continue
       fresh.append(line)
-    return "\n".join(fresh)
+    return self._select_player_message("\n".join(fresh))
 
   def _conversation_key(self, txt):
     filtered = self._filter_screen_text(txt)
@@ -327,6 +444,12 @@ class SkyCompanionAgent:
       if len(clean) <= 1:
         return True
       if clean in ("你", "我", "他", "她", "它", "们", "我们", "你们", "现在"):
+        return True
+    if len(lines) > 1:
+      total = sum(len(line) for line in lines)
+      if all(len(line) <= 1 for line in lines):
+        return True
+      if total <= 4 and not any(h in filtered for h in STRONG_CHAT_HINTS):
         return True
     return False
 
@@ -402,7 +525,10 @@ class SkyCompanionAgent:
     """Gemini识图（通过hohoapi）"""
     shot = shot or capture_window()
     if not shot: return ""
-    shot = shot.resize((shot.width*9//10, shot.height*9//10))
+    max_side = 900
+    if max(shot.size) > max_side:
+      scale = max_side / max(shot.size)
+      shot = shot.resize((max(1, int(shot.width * scale)), max(1, int(shot.height * scale))))
     buf = io.BytesIO(); shot.save(buf, format="JPEG", quality=70)
     b64 = base64.b64encode(buf.getvalue()).decode()
     t0 = time.time()
@@ -471,14 +597,20 @@ class SkyCompanionAgent:
 
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
-    filtered_msg = self._filter_screen_text(new_msg)
+    filtered_msg = self._select_player_message(self._filter_screen_text(new_msg))
     if not filtered_msg or self._is_too_fragmentary(filtered_msg):
       self._log("Skip: " + new_msg.replace("\n", " | ")[:80])
       self._mark_seen(new_msg, replied=False)
       return False
+    if not self._should_reply(filtered_msg):
+      self._log("Skip: " + filtered_msg.replace("\n", " | ")[:80])
+      self._mark_seen(filtered_msg, replied=False)
+      return False
     self._log("New: " + filtered_msg.replace("\n", " | ")[:80])
 
     reply = self._ch(filtered_msg)
+    if not reply and self._must_reply(filtered_msg):
+      reply = self._fallback_reply(filtered_msg)
     self._log("DS: " + (reply[:50] if reply else "empty"))
     if not reply:
       self._log("Decide: no reply")
@@ -518,6 +650,7 @@ class SkyCompanionAgent:
         "你要先从列表里判断有没有“玩家最新对你说的话”。如果没有，就输出 EMPTY。\n"
         "只有当玩家在跟你打招呼、问你、喊你、接你的话、给你指令、或上下文自然需要回应时才回复。\n"
         "玩家催你说话、问你在不在、说你不说话/哑巴了吗/理我/回话时，一定要自然回应。\n"
+        "玩家问你是谁、问你为什么卡、问扫描/识别是不是错了，也要自然回应，不要输出 EMPTY。\n"
         "玩家表达情绪、吐槽、抱怨、调侃时也要自然接一句，比如“我服”“别狂了”“笑死”。\n"
         "忽略系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、以及不需要接话的文字。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"

@@ -10,6 +10,9 @@ outputs/screenshots/
 user_data/
 *.png
 *.jpg
+*.log
+*.err.log
+auto_choice_1.txt
 
 # 编辑器
 .vscode/
