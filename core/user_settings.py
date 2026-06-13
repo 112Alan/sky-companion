@@ -11,6 +11,9 @@ from config import PROJECT_ROOT
 USER_DATA_DIR = os.path.join(PROJECT_ROOT, "user_data")
 SETTINGS_FILE = os.path.join(USER_DATA_DIR, "settings.json")
 MEMORY_FILE = os.path.join(USER_DATA_DIR, "memory.json")
+MEMORY_VERSION = 2
+RAW_TURN_KEEP = 80
+PENDING_TURN_KEEP = 30
 
 DEFAULT_SETTINGS = {
     "companion_name": "",
@@ -25,7 +28,7 @@ DEFAULT_SETTINGS = {
     "chat": {
         "provider": "deepseek",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
+        "model": "deepseek-v4-flash",
         "api_key": "",
     },
 }
@@ -143,36 +146,129 @@ def chat_url(base_url):
     return base + "/chat/completions"
 
 
+def _empty_memory():
+    return {
+        "version": MEMORY_VERSION,
+        "profile_prompt": "",
+        "profile_updated_at": "",
+        "raw_turns": [],
+        "pending_turns": [],
+    }
+
+
+def _normalize_turn(item):
+    if not isinstance(item, dict):
+        return None
+    player = str(item.get("player", "") or "").strip()
+    companion = str(item.get("companion", "") or "").strip()
+    if not player and not companion:
+        return None
+    return {
+        "time": str(item.get("time", "") or datetime.now().strftime("%Y-%m-%d %H:%M")),
+        "player": player[:160],
+        "companion": companion[:160],
+    }
+
+
+def _normalize_memory(data):
+    memory = _empty_memory()
+    if isinstance(data, list):
+        turns = [_normalize_turn(item) for item in data]
+        turns = [item for item in turns if item]
+        memory["raw_turns"] = turns[-RAW_TURN_KEEP:]
+        memory["pending_turns"] = turns[-PENDING_TURN_KEEP:]
+        return memory
+    if isinstance(data, dict):
+        memory["profile_prompt"] = str(data.get("profile_prompt", "") or "").strip()
+        memory["profile_updated_at"] = str(data.get("profile_updated_at", "") or "")
+        raw_turns = [_normalize_turn(item) for item in data.get("raw_turns", [])]
+        pending_turns = [_normalize_turn(item) for item in data.get("pending_turns", [])]
+        memory["raw_turns"] = [item for item in raw_turns if item][-RAW_TURN_KEEP:]
+        memory["pending_turns"] = [item for item in pending_turns if item][-PENDING_TURN_KEEP:]
+    return memory
+
+
+def save_memory(memory):
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(_normalize_memory(memory), f, ensure_ascii=False, indent=2)
+
+
 def load_memory():
     os.makedirs(USER_DATA_DIR, exist_ok=True)
     if not os.path.exists(MEMORY_FILE):
-        return []
+        return _empty_memory()
     try:
-        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+        with open(MEMORY_FILE, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
-            return data if isinstance(data, list) else []
+            return _normalize_memory(data)
     except Exception:
-        return []
+        return _empty_memory()
 
 
 def add_memory(player_text, companion_text):
     memory = load_memory()
-    memory.append({
+    turn = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "player": player_text[:120],
         "companion": companion_text[:120],
-    })
-    memory = memory[-200:]
-    os.makedirs(USER_DATA_DIR, exist_ok=True)
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(memory, f, ensure_ascii=False, indent=2)
+    }
+    memory["raw_turns"].append(turn)
+    memory["pending_turns"].append(turn)
+    memory["raw_turns"] = memory["raw_turns"][-RAW_TURN_KEEP:]
+    memory["pending_turns"] = memory["pending_turns"][-PENDING_TURN_KEEP:]
+    save_memory(memory)
     return memory
 
 
 def memory_prompt(memory, limit=12):
-    if not memory:
-        return "暂无长期记忆。"
+    memory = _normalize_memory(memory)
     lines = []
-    for item in memory[-limit:]:
+    profile = memory.get("profile_prompt", "").strip()
+    if profile:
+        lines.append(profile)
+    else:
+        lines.append("暂无稳定长期理解。先按性格提示词自然聊天，不要假装知道没有确认过的事。")
+    pending = memory.get("pending_turns", [])[-min(4, limit):]
+    if pending:
+        lines.append("\n最近还没整理进长期记忆的片段，仅作当前上下文参考：")
+    for item in pending:
         lines.append(f"- {item.get('time', '')} 玩家说：{item.get('player', '')}；你回：{item.get('companion', '')}")
     return "\n".join(lines)
+
+
+def memory_pending_turns(memory, limit=16):
+    memory = _normalize_memory(memory)
+    return memory.get("pending_turns", [])[-limit:]
+
+
+def memory_recent_turns(memory, limit=80):
+    memory = _normalize_memory(memory)
+    return memory.get("raw_turns", [])[-limit:]
+
+
+def memory_companion_replies(memory, limit=80):
+    return [
+        item.get("companion", "")
+        for item in memory_recent_turns(memory, limit)
+        if item.get("companion")
+    ]
+
+
+def memory_needs_update(memory, min_pending=6):
+    memory = _normalize_memory(memory)
+    pending = memory.get("pending_turns", [])
+    if len(pending) >= min_pending:
+        return True
+    return bool(pending) and not memory.get("profile_prompt", "").strip()
+
+
+def update_memory_profile(memory, profile_prompt):
+    memory = _normalize_memory(memory)
+    profile_prompt = str(profile_prompt or "").strip()
+    if profile_prompt:
+        memory["profile_prompt"] = profile_prompt[:1800]
+        memory["profile_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        memory["pending_turns"] = []
+        save_memory(memory)
+    return memory

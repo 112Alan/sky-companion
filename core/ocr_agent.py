@@ -7,7 +7,17 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.screen_capture import capture_window, window_exists
 from core.game_controller import activate_sky_window, GameController
-from core.user_settings import add_memory, chat_url, ensure_settings, load_memory, memory_prompt
+from core.user_settings import (
+  add_memory,
+  chat_url,
+  ensure_settings,
+  load_memory,
+  memory_companion_replies,
+  memory_needs_update,
+  memory_pending_turns,
+  memory_prompt,
+  update_memory_profile,
+)
 from openai import OpenAI
 
 ctrl = GameController()
@@ -101,6 +111,7 @@ class SkyCompanionAgent:
     self.dialogue_turns = []
     self.last_vision_fallback_at = time.time()
     self.last_local_ocr_error_at = 0
+    self.memory_updating = False
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
 
@@ -319,11 +330,9 @@ class SkyCompanionAgent:
     for w in self.my_words[-4:]:
       if w and (self._same_own_reply(txt, w) or self._same(txt, w) or self._contains_clean(txt, w)):
         return True
-    for item in self.memory[-80:]:
-      if isinstance(item, dict):
-        old_reply = item.get("companion", "")
-        if old_reply and self._same_own_reply(txt, old_reply, memory=True):
-          return True
+    for old_reply in memory_companion_replies(self.memory, 80):
+      if old_reply and self._same_own_reply(txt, old_reply, memory=True):
+        return True
     return False
 
   def _hold_candidate(self, txt):
@@ -828,7 +837,84 @@ class SkyCompanionAgent:
     self.last_time = time.time()
     self.skip = 3
     time.sleep(0.3)
+    self._maybe_update_memory()
     return True
+
+  def _chat_extra_body(self):
+    model = str(self.chat.get("model", "")).lower()
+    base = str(self.chat.get("base_url", "")).lower()
+    if "deepseek" in model or "deepseek" in base:
+      return {"thinking": {"type": "disabled"}}
+    return None
+
+  def _chat_completion(self, prompt, temperature=0.9, max_tokens=60):
+    kwargs = {
+      "model": self.chat["model"],
+      "messages": [{"role": "user", "content": prompt}],
+      "temperature": temperature,
+      "max_tokens": max_tokens,
+    }
+    extra_body = self._chat_extra_body()
+    if extra_body:
+      kwargs["extra_body"] = extra_body
+    return self.dclient.chat.completions.create(**kwargs)
+
+  def _clean_memory_summary(self, txt):
+    txt = (txt or "").strip()
+    txt = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", txt, flags=re.I | re.S).strip()
+    txt = txt.replace("长期记忆：", "").strip()
+    lines = []
+    for line in txt.splitlines():
+      line = line.strip()
+      if not line:
+        continue
+      if any(secret in line.lower() for secret in ("api key", "apikey", "sk-", "base_url", "http://", "https://")):
+        continue
+      lines.append(line)
+    return "\n".join(lines).strip()
+
+  def _maybe_update_memory(self, force=False):
+    if self.memory_updating:
+      return
+    if not force and not memory_needs_update(self.memory, min_pending=6):
+      return
+    pending = memory_pending_turns(self.memory, limit=16)
+    if not pending:
+      return
+    self.memory_updating = True
+    try:
+      transcript = []
+      for item in pending:
+        player = item.get("player", "").replace("\n", " / ")
+        companion = item.get("companion", "").replace("\n", " / ")
+        transcript.append(f"{item.get('time', '')} 玩家：{player}\n{self.companion_name}：{companion}")
+      old_profile = str(self.memory.get("profile_prompt", "") or "").strip() or "暂无。"
+      p = (
+        "你是光遇AI伴侣的长期记忆整理器。请把最近对话整合成一段可直接放进聊天提示词的长期理解。\n"
+        "目标：让AI越来越了解使用者，而不是死记原句。\n"
+        "要求：\n"
+        "1. 只保留稳定信息：使用者称呼、关系氛围、偏好、讨厌点、常见玩法、说话风格、当前持续状态。\n"
+        "2. 删除一次性寒暄、重复句、OCR乱码、系统提示、明显误识别、API/程序/日志相关内容。\n"
+        "3. 不要编造，不确定就别写。\n"
+        "4. 写给AI自己看，用第二人称/指令式都可以，中文，短句。\n"
+        "5. 最近状态必须写成“最近/上次...”，不要当成永久事实。\n"
+        "6. 控制在350字以内，只输出整理后的记忆正文。\n\n"
+        "已有长期理解：\n" + old_profile + "\n\n"
+        "最近对话素材：\n" + "\n\n".join(transcript)
+      )
+      self._log("Mem: updating")
+      r = self._chat_completion(p, temperature=0.2, max_tokens=520)
+      ans = r.choices[0].message.content.strip() if r.choices else ""
+      summary = self._clean_memory_summary(ans)
+      if len(summary) >= 20:
+        self.memory = update_memory_profile(self.memory, summary)
+        self._log("Mem: updated")
+      else:
+        self._log("Mem: skipped")
+    except Exception as e:
+      self._log("Mem: " + str(e)[:60])
+    finally:
+      self.memory_updating = False
 
   def _ch(self, txt):
     if not txt: return ""
@@ -854,7 +940,7 @@ class SkyCompanionAgent:
         "你刚说过的话只用于识别回声，不要继续复读：" + recent + "\n"
         "屏幕白色文字列表：\n" + txt
       )
-      r = self.dclient.chat.completions.create(model=self.chat["model"],messages=[{"role":"user","content":p}],temperature=0.9,max_tokens=60)
+      r = self._chat_completion(p, temperature=0.9, max_tokens=60)
       ans = r.choices[0].message.content.strip() if r.choices else ""
       return "" if ans.upper() == "EMPTY" else ans
     except Exception as e:
