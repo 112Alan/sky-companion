@@ -10,10 +10,10 @@ import os
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 # ========== 默认模型配置（不包含 API Key） ==========
-DEFAULT_VISION_BASE_URL = "https://www.hohoapi.com/v1"
-DEFAULT_VISION_MODEL = "gemini-2.5-flash"
+DEFAULT_VISION_BASE_URL = ""
+DEFAULT_VISION_MODEL = "windows-ocr"
 DEFAULT_CHAT_BASE_URL = "https://api.deepseek.com"
-DEFAULT_CHAT_MODEL = "deepseek-chat"
+DEFAULT_CHAT_MODEL = "deepseek-v4-pro"
 
 # ========== 光遇游戏窗口标题 ==========
 SKY_WINDOW_TITLES = [

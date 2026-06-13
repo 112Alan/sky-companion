@@ -12,30 +12,35 @@ USER_DATA_DIR = os.path.join(PROJECT_ROOT, "user_data")
 SETTINGS_FILE = os.path.join(USER_DATA_DIR, "settings.json")
 MEMORY_FILE = os.path.join(USER_DATA_DIR, "memory.json")
 STYLE_KNOWLEDGE_FILE = os.path.join(USER_DATA_DIR, "style_knowledge.json")
+SEARCH_KNOWLEDGE_FILE = os.path.join(USER_DATA_DIR, "search_knowledge.json")
 MEMORY_VERSION = 2
 RAW_TURN_KEEP = 80
 PENDING_TURN_KEEP = 30
+SEARCH_KNOWLEDGE_KEEP = 40
 
 DEFAULT_SETTINGS = {
     "companion_name": "",
     "user_call_name": "",
     "personality_prompt": "",
     "vision": {
-        "provider": "gemini",
-        "base_url": "https://www.hohoapi.com/v1",
-        "model": "gemini-2.5-flash",
+        "provider": "local_ocr",
+        "base_url": "",
+        "model": "windows-ocr",
         "api_key": "",
     },
     "chat": {
         "provider": "deepseek",
         "base_url": "https://api.deepseek.com",
-        "model": "deepseek-v4-flash",
+        "model": "deepseek-v4-pro",
         "api_key": "",
     },
     "web_search": {
         "enabled": True,
         "provider": "auto",
         "max_results": 3,
+    },
+    "vision_fallback": {
+        "enabled": False,
     },
 }
 
@@ -82,13 +87,25 @@ def _ask_secret(prompt):
 
 def _configure_model(settings, kind):
     is_vision = kind == "vision"
-    label = "视觉识别模型"
-    default_name = "Gemini"
+    label = "可选视觉兜底模型"
+    default_name = "视觉模型"
     if not is_vision:
         label = "聊天回复模型"
         default_name = "DeepSeek"
 
     current = settings[kind]
+    if not is_vision:
+        print("请填写 DeepSeek 聊天模型配置。")
+        current["provider"] = "deepseek"
+        current["base_url"] = _ask("DeepSeek 接口网址 base_url", current.get("base_url") or "https://api.deepseek.com")
+        current["model"] = _ask("DeepSeek 模型名", current.get("model") or "deepseek-v4-pro")
+        while not current.get("api_key"):
+            current["api_key"] = _ask_secret("DeepSeek API Key")
+            if not current["api_key"]:
+                print("API Key 不能为空。")
+        settings[kind] = current
+        return
+
     has_default = _ask(f"你有 {default_name} 的 API Key 吗？有就回车，没有输入 n", "y").lower()
     if has_default in ("n", "no", "没有", "mei", "0"):
         print(f"请填写自定义{label}，要求兼容 OpenAI Chat Completions 接口。")
@@ -100,7 +117,7 @@ def _configure_model(settings, kind):
         while not current.get("model"):
             current["model"] = _ask("模型名")
     else:
-        current["provider"] = "gemini" if is_vision else "deepseek"
+        current["provider"] = "custom_vision" if is_vision else "deepseek"
         current["base_url"] = _ask("接口网址 base_url", current["base_url"])
         current["model"] = _ask("模型名", current["model"])
 
@@ -114,8 +131,10 @@ def _configure_model(settings, kind):
 def ensure_settings():
     settings = load_settings()
 
-    if not settings["vision"].get("api_key"):
-        _configure_model(settings, "vision")
+    # 默认只用 Windows 本地 OCR 识别光遇文字，不强制要求额外视觉模型。
+    # 视觉模型只作为高级兜底配置，用户手动打开 vision_fallback.enabled 时才会用到。
+    if not settings.get("vision"):
+        settings["vision"] = copy.deepcopy(DEFAULT_SETTINGS["vision"])
         save_settings(settings)
 
     if not settings["chat"].get("api_key"):
@@ -235,6 +254,108 @@ def save_style_knowledge(data):
     with open(STYLE_KNOWLEDGE_FILE, "w", encoding="utf-8") as f:
         json.dump(safe, f, ensure_ascii=False, indent=2)
     return safe
+
+
+def _safe_public_text(text, limit=600):
+    text = str(text or "").strip()
+    blocked = ("api key", "apikey", "sk-", "base_url", "http://", "https://")
+    lines = []
+    for line in text.splitlines():
+        low = line.lower()
+        if any(secret in low for secret in blocked):
+            continue
+        line = line.strip()
+        if line:
+            lines.append(line)
+    return "\n".join(lines)[:limit]
+
+
+def load_search_knowledge():
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    if not os.path.exists(SEARCH_KNOWLEDGE_FILE):
+        return []
+    try:
+        with open(SEARCH_KNOWLEDGE_FILE, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            return []
+        items = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            query = _safe_public_text(item.get("query", ""), 80)
+            summary = _safe_public_text(item.get("summary", ""), 420)
+            if query and summary:
+                items.append({
+                    "time": str(item.get("time", "") or ""),
+                    "query": query,
+                    "summary": summary,
+                })
+        return items[-SEARCH_KNOWLEDGE_KEEP:]
+    except Exception:
+        return []
+
+
+def save_search_knowledge(items):
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    safe = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        query = _safe_public_text(item.get("query", ""), 80)
+        summary = _safe_public_text(item.get("summary", ""), 420)
+        if query and summary:
+            safe.append({
+                "time": str(item.get("time", "") or datetime.now().strftime("%Y-%m-%d %H:%M")),
+                "query": query,
+                "summary": summary,
+            })
+    safe = safe[-SEARCH_KNOWLEDGE_KEEP:]
+    with open(SEARCH_KNOWLEDGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(safe, f, ensure_ascii=False, indent=2)
+    return safe
+
+
+def add_search_knowledge(query, summary):
+    query = _safe_public_text(query, 80)
+    summary = _safe_public_text(summary, 420)
+    if not query or not summary or "搜索没有拿到可靠结果" in summary:
+        return load_search_knowledge()
+    items = load_search_knowledge()
+    key = "".join(ch for ch in query.lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    kept = []
+    for item in items:
+        old_key = "".join(ch for ch in item.get("query", "").lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+        if old_key != key:
+            kept.append(item)
+    kept.append({
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "query": query,
+        "summary": summary,
+    })
+    return save_search_knowledge(kept)
+
+
+def search_knowledge_prompt(items, current_text="", limit=3):
+    items = load_search_knowledge() if items is None else list(items or [])
+    if not items:
+        return ""
+    current = str(current_text or "")
+    current_chars = set(ch for ch in current if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+    ranked = []
+    for item in items:
+        hay = str(item.get("query", "") + item.get("summary", ""))
+        hay_chars = set(ch for ch in hay if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+        score = len(current_chars & hay_chars)
+        ranked.append((score, item))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    selected = [item for score, item in ranked if score >= 2][:limit]
+    if not selected:
+        selected = [item for _, item in ranked[:1]]
+    lines = []
+    for item in selected:
+        lines.append("- " + item.get("query", "") + "：" + item.get("summary", "").replace("\n", " / "))
+    return "\n".join(lines)
 
 
 def add_memory(player_text, companion_text):

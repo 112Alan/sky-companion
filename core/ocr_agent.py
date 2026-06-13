@@ -9,15 +9,18 @@ from core.screen_capture import capture_window, sky_window_foreground, window_ex
 from core.game_controller import activate_sky_window, GameController
 from core.web_search import format_results, search_web
 from core.user_settings import (
+  add_search_knowledge,
   add_memory,
   chat_url,
   ensure_settings,
   load_memory,
+  load_search_knowledge,
   load_style_knowledge,
   memory_companion_replies,
   memory_needs_update,
   memory_pending_turns,
   memory_prompt,
+  search_knowledge_prompt,
   save_style_knowledge,
   update_memory_profile,
 )
@@ -34,6 +37,7 @@ VISION_FALLBACK_INTERVAL = 8.0
 VISION_FALLBACK_ON_EMPTY = False
 WEB_SEARCH_CACHE_SECONDS = 300
 WEB_SEARCH_TIMEOUT = 4.5
+SEARCH_KNOWLEDGE_MIN_CHARS = 3
 
 VISION_PROMPT = """You are reading a Sky: Children of the Light screenshot.
 Extract only player chat text from chat bubbles or the opened chat history.
@@ -103,6 +107,7 @@ class SkyCompanionAgent:
     self.dclient = OpenAI(api_key=self.chat["api_key"], base_url=self.chat["base_url"])
     self.memory = load_memory()
     self.style_knowledge = load_style_knowledge()
+    self.search_knowledge = load_search_knowledge()
     self.style_checked = False
     self.my_words = []; self.last_time = 0
     self.prev = None; self.last_text = ""
@@ -181,6 +186,8 @@ class SkyCompanionAgent:
 
   def _must_reply(self, txt):
     clean = self._clean_text(txt)
+    if self._explicit_search_request(txt) or self._looks_like_unknown_term_question(txt):
+      return True
     return any(h in txt or h in clean for h in MUST_REPLY_HINTS)
 
   def _fallback_reply(self, txt):
@@ -201,14 +208,35 @@ class SkyCompanionAgent:
       return "等你发话呢。"
     return ""
 
+  def _explicit_search_request(self, txt):
+    clean = self._clean_text(txt)
+    return any(x in txt or x in clean for x in (
+      "搜", "搜索", "查一下", "查查", "帮我查", "上网查", "百度一下",
+      "资料", "攻略", "百科", "什么意思", "啥意思", "什么梗", "什么东西",
+    ))
+
+  def _looks_like_unknown_term_question(self, txt):
+    clean = self._clean_text(txt)
+    if len(clean) < SEARCH_KNOWLEDGE_MIN_CHARS:
+      return False
+    patterns = (
+      r"(.{2,18})(是什么|是啥|啥意思|什么意思|什么梗|怎么理解)",
+      r"(什么是|啥是)(.{2,18})",
+      r"(这个|那个|这|那).{1,10}(是什么|是啥|啥意思|什么意思)",
+    )
+    if any(re.search(p, txt or "") for p in patterns):
+      return True
+    if re.search(r"[A-Za-z]{3,}", txt or "") and any(x in clean for x in ("什么", "意思", "怎么", "教程", "攻略")):
+      return True
+    return False
+
   def _needs_web_search(self, txt):
     clean = self._clean_text(txt)
     if len(clean) < 4:
       return False
     if any(x in clean for x in ("去不去任务", "任务去不去", "做任务去不去", "走任务", "跑图不", "跑图吗")):
       return False
-    explicit = ("搜", "查一下", "上网", "百度", "资料", "攻略", "最新", "新闻")
-    if any(x in txt or x in clean for x in explicit):
+    if self._explicit_search_request(txt) or self._looks_like_unknown_term_question(txt):
       return True
     time_words = ("今天", "今日", "现在", "最新", "本周", "明天", "昨天", "这周", "这个月")
     sky_topics = ("光遇", "任务", "每日", "复刻", "先祖", "季节蜡烛", "大蜡烛", "红石", "黑石", "活动", "兑换图")
@@ -226,6 +254,25 @@ class SkyCompanionAgent:
     compact = self._clean_text(clean)
     today = time.strftime("%Y年%m月%d日")
     month = time.strftime("%Y年%m月")
+    explicit = re.search(r"(?:帮我|你|小懒)?(?:搜(?:一下|下)?|搜索|查一下|查查|帮我查|上网查|百度一下)\s*[：:，,。 ]*(.+)", clean)
+    if explicit:
+      query = explicit.group(1).strip()
+      query = re.sub(r"(吧|呢|呀|啊|可以吗|行吗|好不好|求你了)$", "", query).strip()
+      if query:
+        if "抖音" in self._clean_text(query) and "site:douyin.com" not in query.lower():
+          query = query + " site:douyin.com"
+        return query[:80]
+    meaning = re.search(r"(.{2,18})(?:是什么|是啥|啥意思|什么意思|什么梗|怎么理解)", clean)
+    if meaning:
+      query = meaning.group(1).strip()
+      query = re.sub(r"^(这个|那个|这|那|你知道|知道)", "", query).strip()
+      if query:
+        return (query + " 是什么 意思")[:80]
+    meaning = re.search(r"(?:什么是|啥是)\s*(.{2,18})", clean)
+    if meaning:
+      query = meaning.group(1).strip()
+      if query:
+        return (query + " 是什么")[:80]
     if "复刻" in compact:
       return ("光遇 " + month + " 最新复刻先祖是谁")[:80]
     if "季节蜡烛" in compact:
@@ -238,6 +285,8 @@ class SkyCompanionAgent:
       return ("光遇 " + today + " 每日任务")[:80]
     sky_topics = ("光遇", "任务", "每日", "复刻", "先祖", "季节蜡烛", "大蜡烛", "红石", "黑石", "活动", "兑换图")
     query = clean
+    if "抖音" in compact and "sitedouyincom" not in compact.lower():
+      query = query + " site:douyin.com"
     if any(x in compact for x in sky_topics) and "光遇" not in compact:
       query = "光遇 " + query
     if any(x in compact for x in ("今天", "今日", "最新", "现在")):
@@ -278,6 +327,7 @@ class SkyCompanionAgent:
     else:
       self._log("Search: " + str(len(results)) + " results")
       context = format_results(results)
+      self.search_knowledge = add_search_knowledge(query, context)
     self.search_cache[key] = (now, context)
     if len(self.search_cache) > 20:
       old_keys = sorted(self.search_cache, key=lambda k: self.search_cache[k][0])[:5]
@@ -985,7 +1035,9 @@ class SkyCompanionAgent:
       return {"available": False, "text": "", "raw_lines": [], "error": str(e)[:160]}
 
   def _do_vision_ocr(self, shot):
-    """Gemini识图兜底。"""
+    """可选视觉模型识图兜底。默认关闭。"""
+    if not (self.vision.get("api_key") and self.vision.get("base_url") and self.vision.get("model")):
+      return ""
     max_side = 900
     if max(shot.size) > max_side:
       scale = max_side / max(shot.size)
@@ -1015,30 +1067,33 @@ class SkyCompanionAgent:
     return ""
 
   def _do_ocr(self, shot=None):
-    """先用本地OCR快扫；必要时才用Gemini兜底。"""
+    """先用本地OCR快扫；可选视觉模型兜底默认关闭。"""
     shot = shot or capture_window()
     if not shot: return ""
+    vision_fallback_enabled = bool((self.settings.get("vision_fallback") or {}).get("enabled", False))
     local = self._do_local_ocr(shot)
     if local.get("available"):
       text = local.get("text", "")
       if text:
         return text
-      # 本地OCR看到了字但都被判成系统/UI，直接跳过，避免每帧都卡视觉模型。
+      # 本地OCR看到了字但都被判成系统/UI，直接跳过，避免每帧都卡可选视觉模型。
       if local.get("raw_lines"):
         return ""
-      if not VISION_FALLBACK_ON_EMPTY:
+      if not VISION_FALLBACK_ON_EMPTY or not vision_fallback_enabled:
         return ""
-      # 完全没扫到字时，偶尔用Gemini兜底一次。
+      # 完全没扫到字时，如果用户手动开启视觉兜底，才偶尔调用一次。
       if time.time() - self.last_vision_fallback_at < VISION_FALLBACK_INTERVAL:
         return ""
       self.last_vision_fallback_at = time.time()
-      self._log("OCR: local empty, Gemini fallback")
+      self._log("OCR: local empty, vision fallback")
       return self._do_vision_ocr(shot)
 
     if time.time() - self.last_local_ocr_error_at > 10:
       self._log("LOCR: " + str(local.get("error", "unavailable"))[:80])
       self.last_local_ocr_error_at = time.time()
     self.last_vision_fallback_at = time.time()
+    if not vision_fallback_enabled:
+      return ""
     return self._do_vision_ocr(shot)
 
   def _news(self, old, new):
@@ -1085,6 +1140,65 @@ class SkyCompanionAgent:
   def _recent_laugh_count(self):
     return sum(1 for w in self.my_words[-5:] if re.search(r"哈{2,}", w or ""))
 
+  def _reply_too_similar(self, reply):
+    clean = self._clean_text(reply)
+    if len(clean) < 4:
+      return False
+    recent = list(self.my_words[-8:]) + memory_companion_replies(self.memory, 24)[-8:]
+    for old in recent:
+      old_clean = self._clean_text(old)
+      if len(old_clean) < 4:
+        continue
+      ratio = difflib.SequenceMatcher(None, clean, old_clean).ratio()
+      sa = set(re.findall(r"[\u4e00-\u9fff]", clean))
+      sb = set(re.findall(r"[\u4e00-\u9fff]", old_clean))
+      overlap = len(sa & sb) / max(1, min(len(sa), len(sb)))
+      if ratio >= 0.72 or (ratio >= 0.58 and overlap >= 0.78):
+        return True
+    return False
+
+  def _rewrite_repetitive_reply(self, player_text, repeated_reply):
+    try:
+      recent = " | ".join([w for w in self.my_words[-6:] if w])
+      p = (
+        "你是" + self.companion_name + "，正在光遇里聊天。\n"
+        "玩家刚说：" + player_text + "\n"
+        "你差点重复这句：" + repeated_reply + "\n"
+        "你最近说过：" + recent + "\n"
+        "请重新给一句不重复、不换汤不换药的短回复。要先理解玩家真实需求；如果看不懂就输出 EMPTY。\n"
+        "中文，6-18字，不要解释，只输出回复正文或 EMPTY。"
+      )
+      r = self._chat_completion(p, temperature=0.55, max_tokens=70)
+      ans = r.choices[0].message.content.strip() if r.choices else ""
+      return "" if ans.upper() == "EMPTY" else ans
+    except Exception:
+      return ""
+
+  def _answer_from_search(self, player_text):
+    context = self._web_search_context(player_text)
+    if not context or "搜索没有拿到可靠结果" in context:
+      return "我查了下，没查准。"
+    try:
+      p = (
+        "玩家在光遇里问：" + player_text + "\n"
+        "下面是联网搜索结果：\n" + context + "\n\n"
+        "请先理解玩家真正想问什么，再用搜索结果总结成一句自然中文回复。\n"
+        "如果是词义解释，就说清楚这个词大概是什么意思；如果结果不可靠，就说没查准。\n"
+        "不要复读搜索标题，不要编造。20-35字，只输出回复正文。"
+      )
+      r = self._chat_completion(p, temperature=0.35, max_tokens=90)
+      ans = r.choices[0].message.content.strip() if r.choices else ""
+      ans = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", ans, flags=re.I | re.S).strip()
+      if ans and ans.upper() != "EMPTY":
+        return ans
+    except Exception as e:
+      self._log("SearchAns: " + str(e)[:50])
+    first = context.splitlines()[0]
+    first = re.sub(r"^\d+\.\s*", "", first)
+    first = first.split("：", 1)[-1] if "：" in first else first
+    first = re.sub(r"\s+", "", first)
+    return (first[:32] + "。") if first else "我查了下，没查准。"
+
   def _polish_reply(self, reply):
     reply = (reply or "").strip().strip("\"'")
     if not reply:
@@ -1113,10 +1227,19 @@ class SkyCompanionAgent:
     self._log("New: " + filtered_msg.replace("\n", " | ")[:80])
 
     reply = self._ch(filtered_msg)
+    if not reply and self._needs_web_search(filtered_msg):
+      reply = self._answer_from_search(filtered_msg)
     if not reply and self._must_reply(filtered_msg):
       reply = self._fallback_reply(filtered_msg)
     if reply:
       reply = self._polish_reply(reply)
+    if reply and self._reply_too_similar(reply):
+      self._log("Repeat: rewrite")
+      rewritten = self._polish_reply(self._rewrite_repetitive_reply(filtered_msg, reply))
+      if rewritten and not self._reply_too_similar(rewritten):
+        reply = rewritten
+      elif not self._must_reply(filtered_msg):
+        reply = ""
     self._log("DS: " + (reply[:50] if reply else "empty"))
     if not reply:
       self._log("Decide: no reply")
@@ -1148,7 +1271,7 @@ class SkyCompanionAgent:
   def _chat_extra_body(self):
     model = str(self.chat.get("model", "")).lower()
     base = str(self.chat.get("base_url", "")).lower()
-    if "deepseek" in model or "deepseek" in base:
+    if ("deepseek" in model or "deepseek" in base) and "flash" in model:
       return {"thinking": {"type": "disabled"}}
     return None
 
@@ -1226,9 +1349,11 @@ class SkyCompanionAgent:
     try:
       recent = " | ".join(self.my_words[-4:])
       search_context = self._web_search_context(txt)
+      learned_search = search_knowledge_prompt(self.search_knowledge, txt)
       style_context = self._style_context()
       style_block = ("联网风格参考：\n" + style_context + "\n") if style_context else ""
       search_block = ("联网搜索结果：\n" + search_context + "\n") if search_context else ""
+      learned_search_block = ("已学到的联网知识：\n" + learned_search + "\n") if learned_search else ""
       laugh_tip = "最近你已经连续用过笑声了，本轮不要用“哈哈”开头。\n" if self._recent_laugh_count() >= 1 else ""
       p = (
         "你的名字是" + self.companion_name + "。你是光遇里的真人朋友，不是工具。\n"
@@ -1236,6 +1361,7 @@ class SkyCompanionAgent:
         "你的性格提示词：" + self.personality_prompt + "\n"
         + style_block +
         "长期记忆：\n" + memory_prompt(self.memory) + "\n"
+        + learned_search_block +
         "最近对话：\n" + self._recent_dialogue_prompt() + "\n"
         + search_block +
         "下面给你的是当前屏幕上识别到的白色中文字列表，里面可能混着聊天、UI、活动标题、物品名、玩家备注、你自己刚说过的话。\n"
@@ -1248,6 +1374,10 @@ class SkyCompanionAgent:
         "遇到乱码、错别字堆、半截输入、只带省略号的文字，看不懂就输出 EMPTY，不要说“你打错字了”。\n"
         "不要主动把话题转成跑图/任务；只有玩家明确问跑图、任务、去不去、走不走时，才接这个话题。\n"
         "如果有联网搜索结果，只在它和玩家问题相关时使用；不确定就说没查准，不要编造。\n"
+        "如果玩家明确让你搜、查资料、问某个词是什么意思，必须优先满足他的要求；先提炼他的关键词，再用搜索结果回答。\n"
+        "如果玩家用了你不懂的词、梗、缩写、活动名或玩法名，结合联网结果理解后再回；仍不懂就承认没查准。\n"
+        "回复前要先在心里判断：玩家是在问知识、发指令、吐槽情绪、接你的话，还是只是屏幕杂字；别只按关键词乱回。\n"
+        "不要短时间重复你刚说过的话，也不要把同一个意思换个词又说一遍；只有玩家明确要求重复/确认时才可以重复。\n"
         "搜索类问题可以回复到35字；普通聊天仍保持6-18字。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"
         "不要每句都喊玩家称呼，只有自然时才喊。\n"
@@ -1258,7 +1388,7 @@ class SkyCompanionAgent:
         "你刚说过的话只用于识别回声，不要继续复读：" + recent + "\n"
         "屏幕白色文字列表：\n" + txt
       )
-      r = self._chat_completion(p, temperature=0.9, max_tokens=60)
+      r = self._chat_completion(p, temperature=0.65, max_tokens=90)
       ans = r.choices[0].message.content.strip() if r.choices else ""
       return "" if ans.upper() == "EMPTY" else ans
     except Exception as e:
@@ -1323,7 +1453,7 @@ class SkyCompanionAgent:
           if time.time() - self.last_empty_ocr_log > 8:
             tip = "OCR: empty"
             if self.empty_ocr_count >= 3:
-              tip += " (检查光遇窗口是否可见、聊天文字是否太小/被遮挡；Gemini只做兜底)"
+              tip += " (检查光遇窗口是否可见、聊天文字是否太小/被遮挡；默认只用本地OCR)"
             self._log(tip)
             self.last_empty_ocr_log = time.time()
           continue
