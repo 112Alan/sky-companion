@@ -1037,6 +1037,23 @@ class SkyCompanionAgent:
     if len(self.ignored_msgs) > 30:
       self.ignored_msgs = self.ignored_msgs[-30:]
 
+  def _recent_laugh_count(self):
+    return sum(1 for w in self.my_words[-5:] if re.search(r"哈{2,}", w or ""))
+
+  def _polish_reply(self, reply):
+    reply = (reply or "").strip().strip("\"'")
+    if not reply:
+      return ""
+    original = reply
+    # "哈哈"很容易变成口癖；开头笑声默认删掉，连续笑过时正文里的也删掉。
+    reply = re.sub(r"^(?:哈[哈啊呀~～,，。！!\s]*)+", "", reply).strip()
+    if self._recent_laugh_count() >= 1:
+      reply = re.sub(r"哈{2,}[，,、\s]*", "", reply).strip()
+    reply = reply.strip("，,。 !！")
+    if not reply or len(self._clean_text(reply)) < 2:
+      reply = original
+    return reply
+
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
     filtered_msg = self._select_player_message(self._filter_screen_text(new_msg))
@@ -1053,13 +1070,14 @@ class SkyCompanionAgent:
     reply = self._ch(filtered_msg)
     if not reply and self._must_reply(filtered_msg):
       reply = self._fallback_reply(filtered_msg)
+    if reply:
+      reply = self._polish_reply(reply)
     self._log("DS: " + (reply[:50] if reply else "empty"))
     if not reply:
       self._log("Decide: no reply")
       self._mark_seen(filtered_msg, replied=False)
       self._remember_turn(filtered_msg, "")
       return False
-    reply = reply.strip().strip("\"\'")
     if len(reply) < 2:
       return False
 
@@ -1163,6 +1181,7 @@ class SkyCompanionAgent:
       style_context = self._style_context()
       style_block = ("联网风格参考：\n" + style_context + "\n") if style_context else ""
       search_block = ("联网搜索结果：\n" + search_context + "\n") if search_context else ""
+      laugh_tip = "最近你已经连续用过笑声了，本轮不要用“哈哈”开头。\n" if self._recent_laugh_count() >= 1 else ""
       p = (
         "你的名字是" + self.companion_name + "。你是光遇里的真人朋友，不是工具。\n"
         "玩家在光遇里的称呼/备注名是：" + self.user_call_name + "\n"
@@ -1184,6 +1203,8 @@ class SkyCompanionAgent:
         "搜索类问题可以回复到35字；普通聊天仍保持6-18字。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"
         "不要每句都喊玩家称呼，只有自然时才喊。\n"
+        "少用“哈哈”，不要把它当开头口癖；连续三轮最多用一次，能不用就不用。\n"
+        + laugh_tip +
         "如果要回复，用中文，6-18个字，像真人朋友，短一点。\n"
         "只输出回复正文或 EMPTY，不要解释你的判断。\n"
         "你刚说过的话只用于识别回声，不要继续复读：" + recent + "\n"
