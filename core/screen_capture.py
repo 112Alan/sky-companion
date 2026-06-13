@@ -68,3 +68,17 @@ def save_screenshot(screenshot, prefix="sky"):
 def window_exists():
     """检查光遇窗口是否存在"""
     return find_sky_window() is not None
+
+def sky_window_foreground():
+    """检查当前前台窗口是否是光遇。"""
+    try:
+        active = gw.getActiveWindow()
+        if not active:
+            return False
+        active_title = active.title or ""
+        for sky_title in SKY_WINDOW_TITLES:
+            if sky_title in active_title:
+                return True
+    except Exception:
+        return False
+    return False

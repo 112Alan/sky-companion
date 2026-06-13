@@ -5,7 +5,7 @@ from pathlib import Path
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 os.environ["PYTHONIOENCODING"] = "utf-8"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from core.screen_capture import capture_window, window_exists
+from core.screen_capture import capture_window, sky_window_foreground, window_exists
 from core.game_controller import activate_sky_window, GameController
 from core.user_settings import (
   add_memory,
@@ -81,6 +81,7 @@ NON_CHAT_SUBSTRINGS = [
   "Start", "Ready", "timeout", "http", "https", "url", "v1chatcompletions",
   "模型", "接口", "配置", "版本", "视觉", "本地", "DeepSeek", "Gemini",
   "回复一条", "这一套", "GitHub", "截图", "识别", "中转站",
+  "同步", "密钥", "扫描", "工作副本", "提交", "推到", "视频", "开发", "桌宠", "分析",
 ]
 
 class SkyCompanionAgent:
@@ -117,6 +118,7 @@ class SkyCompanionAgent:
     self.last_vision_fallback_at = time.time()
     self.last_local_ocr_error_at = 0
     self.memory_updating = False
+    self.last_not_foreground_log = 0
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
 
@@ -1057,6 +1059,11 @@ class SkyCompanionAgent:
             self._send_reply(msg)
           continue
         if time.time() < self.next_ocr_at:
+          continue
+        if not sky_window_foreground():
+          if time.time() - self.last_not_foreground_log > 8:
+            self._log("Watch: 光遇不在前台，暂停识别。")
+            self.last_not_foreground_log = time.time()
           continue
         shot = capture_window()
         if not shot: continue
