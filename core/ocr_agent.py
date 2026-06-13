@@ -44,6 +44,7 @@ If there is no clear player chat message, return EMPTY."""
 
 SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
+DISTORTED_ECHO_WINDOW = 15.0
 OCR_MIN_INTERVAL = 0.6
 ECHO_BACKOFF = 2.0
 MSG_STABLE_SECONDS = 1.15
@@ -108,6 +109,7 @@ class SkyCompanionAgent:
     self.seen = []; self.last_text = ""
     self.last_sent_text = ""
     self.last_sent_at = 0
+    self.sent_history = []
     self.next_ocr_at = 0
     self.echo_backoff_until = 0
     self.last_ignored_text = ""
@@ -471,6 +473,42 @@ class SkyCompanionAgent:
       return ratio >= 0.72 or (ratio >= 0.58 and overlap >= 0.80)
     return ratio >= 0.58 or overlap >= 0.70
 
+  def _looks_like_player_question(self, txt):
+    clean = self._clean_text(txt)
+    if not clean:
+      return False
+    if re.search(r"[?？]", txt or ""):
+      return True
+    return any(x in clean for x in ("吗", "嘛", "么", "什么", "怎么", "为啥", "为什么", "谁", "哪", "哪里", "干嘛"))
+
+  def _distorted_own_reply(self, txt, own):
+    """OCR有时会把自己刚说的话读歪，按弱相似度挡一层。"""
+    if self._looks_like_player_question(txt):
+      return False
+    a = self._echo_key(txt)
+    b = self._echo_key(own)
+    if len(a) < 4 or len(b) < 4:
+      return False
+    sa = set(re.findall(r"[\u4e00-\u9fff]", a))
+    sb = set(re.findall(r"[\u4e00-\u9fff]", b))
+    if not sa or not sb:
+      return False
+    common = sa & sb
+    overlap = len(common) / max(1, min(len(sa), len(sb)))
+    if overlap >= 0.55 and len(common) >= 4:
+      return True
+    action_groups = [
+      ("走", "跟", "我", "你"),
+      ("说", "看", "清"),
+      ("问", "干嘛"),
+      ("等", "你"),
+      ("猜", "到"),
+    ]
+    for group in action_groups:
+      if all(ch in a for ch in group) and sum(1 for ch in group if ch in b) >= max(2, len(group) - 1):
+        return True
+    return False
+
   def _ignore_remarks(self):
     names = [self.companion_name, self.user_call_name] + DEFAULT_IGNORE_REMARKS
     return [n for n in names if n]
@@ -550,6 +588,13 @@ class SkyCompanionAgent:
       clean_new = self._clean_text(txt)
       clean_self = self._clean_text(self.last_sent_text)
       if clean_new and clean_self and (clean_new in clean_self or clean_self in clean_new):
+        return True
+      if time.time() - self.last_sent_at < DISTORTED_ECHO_WINDOW and self._distorted_own_reply(txt, self.last_sent_text):
+        return True
+    now = time.time()
+    self.sent_history = [(w, ts) for w, ts in self.sent_history if now - ts < SELF_ECHO_WINDOW]
+    for w, ts in self.sent_history[-6:]:
+      if now - ts < DISTORTED_ECHO_WINDOW and self._distorted_own_reply(txt, w):
         return True
     for w in self.my_words[-4:]:
       if w and (self._same_own_reply(txt, w) or self._same(txt, w) or self._contains_clean(txt, w)):
@@ -1087,6 +1132,9 @@ class SkyCompanionAgent:
     self.my_words.append(reply)
     self.last_sent_text = reply
     self.last_sent_at = time.time()
+    self.sent_history.append((reply, self.last_sent_at))
+    if len(self.sent_history) > 12:
+      self.sent_history = self.sent_history[-12:]
     self._mark_seen(filtered_msg, replied=True)
     self.memory = add_memory(filtered_msg, reply)
     self._remember_turn(filtered_msg, reply)
