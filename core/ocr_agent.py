@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Sky Companion - screenshot OCR chat agent."""
-import sys, os, time, re, base64, io, json, requests, numpy as np
+import sys, os, time, re, base64, io, json, subprocess, difflib, requests, numpy as np
+from pathlib import Path
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 os.environ["PYTHONIOENCODING"] = "utf-8"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.screen_capture import capture_window, window_exists
@@ -9,6 +11,14 @@ from core.user_settings import add_memory, chat_url, ensure_settings, load_memor
 from openai import OpenAI
 
 ctrl = GameController()
+
+APP_DIR = Path(__file__).resolve().parents[1]
+LOCAL_OCR_SCRIPT = APP_DIR / "windows_ocr.ps1"
+LOCAL_OCR_IMAGE = APP_DIR / "outputs" / "ocr_latest.jpg"
+LOCAL_OCR_TIMEOUT = 3
+VISION_TIMEOUT = 8
+VISION_FALLBACK_INTERVAL = 8.0
+VISION_FALLBACK_ON_EMPTY = False
 
 VISION_PROMPT = """You are reading a Sky: Children of the Light screenshot.
 Extract only player chat text from chat bubbles or the opened chat history.
@@ -89,6 +99,8 @@ class SkyCompanionAgent:
     self.ignored_msgs = []
     self.scanned_msgs = []
     self.dialogue_turns = []
+    self.last_vision_fallback_at = time.time()
+    self.last_local_ocr_error_at = 0
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
 
@@ -173,12 +185,58 @@ class SkyCompanionAgent:
       return True
     return False
 
+  def _looks_like_ocr_garbage(self, txt):
+    clean = self._clean_text(txt)
+    if not clean:
+      return True
+    zh = re.findall(r"[\u4e00-\u9fff]", clean)
+    digits = re.findall(r"\d", clean)
+    if not zh:
+      return True
+    if "吗" in clean and len(zh) >= 2:
+      return False
+    if len(zh) <= 1 and (len(clean) <= 3 or len(digits) >= 1):
+      return True
+    if len(digits) >= 2 and len(zh) <= 2:
+      return True
+    if re.search(r"[0oO@]{2,}", clean) and len(zh) <= 2:
+      return True
+    return False
+
   def _contains_clean(self, a, b, min_len=2):
     ca = self._clean_text(a)
     cb = self._clean_text(b)
     if len(ca) < min_len or len(cb) < min_len:
       return False
     return ca in cb or cb in ca
+
+  def _echo_key(self, txt):
+    clean = self._clean_text(txt)
+    for name in self._ignore_remarks():
+      n = self._clean_text(name)
+      if n:
+        clean = clean.replace(n, "")
+    clean = re.sub(r"^[0oO]+", "", clean)
+    return clean
+
+  def _same_own_reply(self, txt, own, memory=False):
+    a = self._echo_key(txt)
+    b = self._echo_key(own)
+    if len(a) < 2 or len(b) < 2:
+      return False
+    if a == b:
+      return True
+    if min(len(a), len(b)) >= 4 and (a in b or b in a):
+      return True
+    if memory and min(len(a), len(b)) < 5:
+      return False
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    sa = set(re.findall(r"[\u4e00-\u9fff]", a))
+    sb = set(re.findall(r"[\u4e00-\u9fff]", b))
+    overlap = len(sa & sb) / max(1, min(len(sa), len(sb)))
+    if memory:
+      return ratio >= 0.72 or (ratio >= 0.58 and overlap >= 0.80)
+    return ratio >= 0.58 or overlap >= 0.70
 
   def _ignore_remarks(self):
     names = [self.companion_name, self.user_call_name] + DEFAULT_IGNORE_REMARKS
@@ -250,6 +308,8 @@ class SkyCompanionAgent:
     if len(lines) > 1:
       return all(self._is_self_echo(line) or self._is_remark_or_name(line) for line in lines)
     if self.last_sent_text and time.time() - self.last_sent_at < SELF_ECHO_WINDOW:
+      if self._same_own_reply(txt, self.last_sent_text):
+        return True
       if self._same(txt, self.last_sent_text):
         return True
       clean_new = self._clean_text(txt)
@@ -257,8 +317,13 @@ class SkyCompanionAgent:
       if clean_new and clean_self and (clean_new in clean_self or clean_self in clean_new):
         return True
     for w in self.my_words[-4:]:
-      if w and (self._same(txt, w) or self._contains_clean(txt, w)):
+      if w and (self._same_own_reply(txt, w) or self._same(txt, w) or self._contains_clean(txt, w)):
         return True
+    for item in self.memory[-80:]:
+      if isinstance(item, dict):
+        old_reply = item.get("companion", "")
+        if old_reply and self._same_own_reply(txt, old_reply, memory=True):
+          return True
     return False
 
   def _hold_candidate(self, txt):
@@ -358,6 +423,8 @@ class SkyCompanionAgent:
         continue
       if self._is_noise_text(line) or self._looks_like_non_chat_line(line):
         continue
+      if self._looks_like_ocr_garbage(line):
+        continue
       if len(clean) <= 2 and not self._has_chat_intent(line):
         continue
       lines.append(line)
@@ -396,6 +463,8 @@ class SkyCompanionAgent:
         continue
       if self._looks_like_ui_text(line) and not self._looks_like_chat(line):
         continue
+      if self._looks_like_ocr_garbage(line):
+        continue
       kept.append(line)
     return "\n".join(kept)
 
@@ -432,6 +501,15 @@ class SkyCompanionAgent:
       best = max(lines, key=len)
     else:
       best = self._clean_text(txt)
+    for name in self._ignore_remarks():
+      n = self._clean_text(name)
+      if n:
+        best = best.replace(n, "")
+    best = re.sub(r"^(吖|啊|呀|哎|诶|喂)+", "", best)
+    for greet in ("你好", "哈喽", "嗨", "晚上好", "早上好", "晚安"):
+      if greet in best and len(best) <= len(greet) + 3:
+        best = greet
+        break
     return re.sub(r"(吗|呢|啊|呀|吧|嘛|哈)+$", "", best)
 
   def _is_too_fragmentary(self, txt):
@@ -462,11 +540,17 @@ class SkyCompanionAgent:
       return True
     if len(a) >= 2 and len(b) >= 2 and (a in b or b in a):
       return True
+    for greet in ("你好", "哈喽", "晚上好", "早上好", "晚安"):
+      if greet in a and greet in b and min(len(a), len(b)) <= len(greet) + 3:
+        return True
     sa = set(re.findall(r"[\u4e00-\u9fff]", a))
     sb = set(re.findall(r"[\u4e00-\u9fff]", b))
     if not sa or not sb:
       return False
     overlap = len(sa & sb) / max(len(sa), len(sb))
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    if ratio >= 0.68 and overlap >= 0.60 and abs(len(a) - len(b)) <= 4:
+      return True
     return overlap >= 0.75 and abs(len(a) - len(b)) <= 3
 
   def _scanned_recently(self, txt):
@@ -521,17 +605,100 @@ class SkyCompanionAgent:
     remarks = " | ".join(self._ignore_remarks())
     return VISION_PROMPT + "\nNever return these own/remark texts: " + recent + " | " + remarks
 
-  def _do_ocr(self, shot=None):
-    """Gemini识图（通过hohoapi）"""
-    shot = shot or capture_window()
-    if not shot: return ""
+  def _normalize_local_ocr_line(self, line):
+    return re.sub(r"\s+", "", str(line or "")).strip()
+
+  def _make_region(self, w, h, ratios):
+    left = max(0, min(w - 1, int(w * ratios[0])))
+    top = max(0, min(h - 1, int(h * ratios[1])))
+    right = max(left + 1, min(w, int(w * ratios[2])))
+    bottom = max(top + 1, min(h, int(h * ratios[3])))
+    return left, top, right, bottom
+
+  def _local_ocr_regions(self, image):
+    w, h = image.size
+    return [
+      self._make_region(w, h, (0.02, 0.10, 0.78, 0.86)),
+      self._make_region(w, h, (0.12, 0.08, 0.96, 0.80)),
+    ]
+
+  def _enhance_local_ocr_crop(self, crop):
+    crop = crop.convert("RGB")
+    resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+    scale = 2 if max(crop.size) < 1400 else 1
+    if scale > 1:
+      crop = crop.resize((crop.width * scale, crop.height * scale), resampling)
+    gray = ImageOps.grayscale(crop)
+    gray = ImageOps.autocontrast(gray)
+    gray = ImageEnhance.Contrast(gray).enhance(1.55)
+    gray = gray.filter(ImageFilter.SHARPEN)
+    return Image.merge("RGB", (gray, gray, gray))
+
+  def _save_local_ocr_target(self, image):
+    LOCAL_OCR_IMAGE.parent.mkdir(parents=True, exist_ok=True)
+    crops = [self._enhance_local_ocr_crop(image.crop(region)) for region in self._local_ocr_regions(image)]
+    gap = 12
+    width = max(crop.width for crop in crops)
+    height = sum(crop.height for crop in crops) + gap * (len(crops) - 1)
+    canvas = Image.new("RGB", (width, height), "black")
+    y = 0
+    for crop in crops:
+      canvas.paste(crop, (0, y))
+      y += crop.height + gap
+    canvas.save(LOCAL_OCR_IMAGE, format="JPEG", quality=86, optimize=True)
+    return str(LOCAL_OCR_IMAGE)
+
+  def _do_local_ocr(self, shot):
+    if not LOCAL_OCR_SCRIPT.exists():
+      return {"available": False, "text": "", "raw_lines": [], "error": "missing windows_ocr.ps1"}
+    try:
+      target = self._save_local_ocr_target(shot)
+      creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+      completed = subprocess.run(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          str(LOCAL_OCR_SCRIPT),
+          target,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=LOCAL_OCR_TIMEOUT,
+        creationflags=creationflags,
+      )
+      if completed.returncode != 0:
+        error = (completed.stderr or completed.stdout or "").strip()
+        return {"available": False, "text": "", "raw_lines": [], "error": error[-160:]}
+      raw_output = (completed.stdout or "{}").strip()
+      if not raw_output.startswith("{"):
+        raw_output = base64.b64decode(raw_output).decode("utf-8")
+      payload = json.loads(raw_output)
+      if "line_codes" in payload:
+        raw_lines = [
+          self._normalize_local_ocr_line("".join(chr(int(code)) for code in line_codes))
+          for line_codes in payload.get("line_codes", [])
+        ]
+      else:
+        raw_lines = [self._normalize_local_ocr_line(line) for line in payload.get("lines", [])]
+      raw_lines = [line for line in raw_lines if line]
+      text = self._parse_vision_text("\n".join(raw_lines))
+      return {"available": True, "text": text, "raw_lines": raw_lines, "error": ""}
+    except Exception as e:
+      return {"available": False, "text": "", "raw_lines": [], "error": str(e)[:160]}
+
+  def _do_vision_ocr(self, shot):
+    """Gemini识图兜底。"""
     max_side = 900
     if max(shot.size) > max_side:
       scale = max_side / max(shot.size)
       shot = shot.resize((max(1, int(shot.width * scale)), max(1, int(shot.height * scale))))
     buf = io.BytesIO(); shot.save(buf, format="JPEG", quality=70)
     b64 = base64.b64encode(buf.getvalue()).decode()
-    t0 = time.time()
     try:
       r = requests.post(chat_url(self.vision["base_url"]),
         headers={"Authorization":"Bearer " + self.vision["api_key"],"Content-Type":"application/json"},
@@ -539,7 +706,7 @@ class SkyCompanionAgent:
           {"type":"text","text":self._vision_prompt()},
           {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,"+b64}}
         ]}],"max_tokens":220},
-        timeout=20)
+        timeout=VISION_TIMEOUT)
       if r.status_code != 200:
         self._log("VHTTP: " + str(r.status_code) + " " + r.text[:80].replace("\n", " "))
         return ""
@@ -553,6 +720,33 @@ class SkyCompanionAgent:
     except Exception as e:
       self._log("V: " + str(e)[:60])
     return ""
+
+  def _do_ocr(self, shot=None):
+    """先用本地OCR快扫；必要时才用Gemini兜底。"""
+    shot = shot or capture_window()
+    if not shot: return ""
+    local = self._do_local_ocr(shot)
+    if local.get("available"):
+      text = local.get("text", "")
+      if text:
+        return text
+      # 本地OCR看到了字但都被判成系统/UI，直接跳过，避免每帧都卡视觉模型。
+      if local.get("raw_lines"):
+        return ""
+      if not VISION_FALLBACK_ON_EMPTY:
+        return ""
+      # 完全没扫到字时，偶尔用Gemini兜底一次。
+      if time.time() - self.last_vision_fallback_at < VISION_FALLBACK_INTERVAL:
+        return ""
+      self.last_vision_fallback_at = time.time()
+      self._log("OCR: local empty, Gemini fallback")
+      return self._do_vision_ocr(shot)
+
+    if time.time() - self.last_local_ocr_error_at > 10:
+      self._log("LOCR: " + str(local.get("error", "unavailable"))[:80])
+      self.last_local_ocr_error_at = time.time()
+    self.last_vision_fallback_at = time.time()
+    return self._do_vision_ocr(shot)
 
   def _news(self, old, new):
     """找出新文字（在new中但不在old中）"""
@@ -720,7 +914,7 @@ class SkyCompanionAgent:
           if time.time() - self.last_empty_ocr_log > 8:
             tip = "OCR: empty"
             if self.empty_ocr_count >= 3:
-              tip += " (检查视觉key/base_url/model、光遇窗口是否可见、聊天文字是否太小/被遮挡)"
+              tip += " (检查光遇窗口是否可见、聊天文字是否太小/被遮挡；Gemini只做兜底)"
             self._log(tip)
             self.last_empty_ocr_log = time.time()
           continue
