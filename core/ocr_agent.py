@@ -41,10 +41,13 @@ SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
 OCR_MIN_INTERVAL = 0.6
 ECHO_BACKOFF = 2.0
-MSG_STABLE_SECONDS = 0.9
+MSG_STABLE_SECONDS = 1.15
+ELLIPSIS_STABLE_SECONDS = 2.2
 REPLY_COOLDOWN = 1.2
 CHANGE_THRESHOLD = 10
 DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
+OCR_GARBAGE_CHARS = set("卩厶艹丶丿丨亅乀乁乛冫冖冂亠乚龴彡彳灬攵犭礻衤讠钅阝饣忄扌氵殄咿忡吣吢杓唥竄孓")
+TOPIC_ONLY_WORDS = set(["跑图", "任务", "做任务", "狂欢", "狂欢季", "编钟"])
 UI_TEXT_HINTS = [
   "狂欢", "狂欢季", "季节", "先祖", "编钟", "任务", "活动", "礼包", "商店", "蜡烛",
   "爱心", "斗篷", "发型", "面具", "乐器", "兑换", "领取", "剩余", "点击",
@@ -55,7 +58,8 @@ CHAT_HINTS = [
   "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "走", "来", "去",
   "你", "我", "咱", "我们", "怎么", "为什么", "什么", "哪", "喊", "吗", "呢",
   "谁", "咋", "干嘛", "会什么", "不去", "说话", "回话", "理我", "不说话", "哑巴",
-  "别", "服", "烦", "笑死", "草", "靠", "无语", "救命", "行", "好",
+  "别", "服", "烦", "笑死", "好笑", "人机", "真人", "禁言", "讲人话", "转人工",
+  "草", "靠", "无语", "救命", "行", "好",
   "？", "?", "！", "!",
 ]
 STRONG_CHAT_HINTS = [
@@ -63,6 +67,7 @@ STRONG_CHAT_HINTS = [
   "走啊", "来吗", "去吗", "去不去", "做任务", "跑图", "说话", "回话",
   "理我", "不说话", "哑巴", "你是谁", "你在干嘛", "你会什么",
   "我服", "笑死", "无语", "救命", "怎么", "为什么", "干嘛", "什么",
+  "好笑", "好好笑", "人机", "真人", "禁言", "讲人话", "转人工", "转人", "带我",
   "？", "?", "！", "!",
 ]
 MUST_REPLY_HINTS = [
@@ -127,9 +132,31 @@ class SkyCompanionAgent:
   def _clean_text(self, txt):
     return re.sub(r"[^\u4e00-\u9fffA-Za-z0-9]", "", txt or "").strip()
 
+  def _norm_ocr_key(self, txt):
+    txt = self._clean_text(txt)
+    table = str.maketrans({
+      "訁": "言",
+      "讠": "言",
+      "門": "门",
+      "冂": "门",
+      "卩": "",
+      "厶": "",
+      "丶": "",
+      "丿": "",
+      "丨": "",
+    })
+    return txt.translate(table)
+
+  def _has_ellipsis_tail(self, txt):
+    return bool(re.search(r"(\.{2,}|…+|。{2,}|[，,、·丶]{2,})\s*$", str(txt or "")))
+
   def _has_chat_intent(self, txt):
     clean = self._clean_text(txt)
     if len(clean) < 2:
+      return False
+    if clean in TOPIC_ONLY_WORDS:
+      return False
+    if self._looks_like_ocr_garbage(txt):
       return False
     if any(h in txt or h in clean for h in STRONG_CHAT_HINTS):
       return True
@@ -197,12 +224,21 @@ class SkyCompanionAgent:
     return False
 
   def _looks_like_ocr_garbage(self, txt):
-    clean = self._clean_text(txt)
+    raw = str(txt or "")
+    clean = self._clean_text(raw)
     if not clean:
       return True
     zh = re.findall(r"[\u4e00-\u9fff]", clean)
     digits = re.findall(r"\d", clean)
+    letters = re.findall(r"[A-Za-z]", clean)
+    symbols = re.findall(r"[^\w\s\u4e00-\u9fff]", raw)
+    garbage_chars = [ch for ch in clean if ch in OCR_GARBAGE_CHARS]
+    strong = any(h in raw or h in clean for h in STRONG_CHAT_HINTS)
     if not zh:
+      return True
+    if self._has_ellipsis_tail(raw):
+      return True
+    if clean in TOPIC_ONLY_WORDS:
       return True
     if "吗" in clean and len(zh) >= 2:
       return False
@@ -212,6 +248,21 @@ class SkyCompanionAgent:
       return True
     if re.search(r"[0oO@]{2,}", clean) and len(zh) <= 2:
       return True
+    if not strong:
+      if re.search(r"^[。．、·丶'\"“”‘’`]+", raw.strip()):
+        return True
+      if re.search(r"[一二三四五六七八九十]{2,}", clean):
+        return True
+      if len(garbage_chars) >= 2:
+        return True
+      if garbage_chars and (digits or letters or symbols or len(clean) <= 4):
+        return True
+      if (digits or letters) and len(zh) <= 4:
+        return True
+      if symbols and len(symbols) >= 2 and len(zh) <= 6:
+        return True
+      if len(clean) >= 6 and (digits or letters or len(garbage_chars) >= 1):
+        return True
     return False
 
   def _contains_clean(self, a, b, min_len=2):
@@ -303,6 +354,8 @@ class SkyCompanionAgent:
         continue
       if self._looks_like_non_chat_line(line):
         continue
+      if self._looks_like_ocr_garbage(line):
+        continue
       if not clean or clean in seen:
         continue
       seen.add(clean)
@@ -356,7 +409,8 @@ class SkyCompanionAgent:
   def _take_stable_candidate(self):
     if not self.candidate_msg:
       return ""
-    if time.time() - self.candidate_since < MSG_STABLE_SECONDS:
+    wait_seconds = ELLIPSIS_STABLE_SECONDS if self._has_ellipsis_tail(self.candidate_msg) else MSG_STABLE_SECONDS
+    if time.time() - self.candidate_since < wait_seconds:
       return ""
     msg = self.candidate_msg
     self.candidate_msg = ""
@@ -386,6 +440,10 @@ class SkyCompanionAgent:
   def _looks_incomplete(self, txt):
     clean = self._clean_text(txt)
     if not clean:
+      return True
+    if self._has_ellipsis_tail(txt):
+      return True
+    if clean in TOPIC_ONLY_WORDS:
       return True
     if len(clean) <= 6 and clean[-1] in "的在把被给和跟又该新":
       return True
@@ -443,6 +501,9 @@ class SkyCompanionAgent:
     if chat_lines:
       return chat_lines[-1]
     if len(lines) > 1:
+      return ""
+    clean = self._clean_text(lines[0])
+    if len(clean) < 7 and not self._has_chat_intent(lines[0]):
       return ""
     return lines[0]
 
@@ -541,8 +602,8 @@ class SkyCompanionAgent:
     return False
 
   def _similar_key(self, a, b):
-    a = self._clean_text(a)
-    b = self._clean_text(b)
+    a = self._norm_ocr_key(a)
+    b = self._norm_ocr_key(b)
     if not a or not b:
       return False
     if a == b:
@@ -559,6 +620,13 @@ class SkyCompanionAgent:
     overlap = len(sa & sb) / max(len(sa), len(sb))
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     if ratio >= 0.68 and overlap >= 0.60 and abs(len(a) - len(b)) <= 4:
+      return True
+    common_prefix = 0
+    for ca, cb in zip(a, b):
+      if ca != cb:
+        break
+      common_prefix += 1
+    if common_prefix >= 2 and ratio >= 0.54 and overlap >= 0.50 and abs(len(a) - len(b)) <= 5:
       return True
     return overlap >= 0.75 and abs(len(a) - len(b)) <= 3
 
@@ -933,6 +1001,8 @@ class SkyCompanionAgent:
         "玩家问你是谁、问你为什么卡、问扫描/识别是不是错了，也要自然回应，不要输出 EMPTY。\n"
         "玩家表达情绪、吐槽、抱怨、调侃时也要自然接一句，比如“我服”“别狂了”“笑死”。\n"
         "忽略系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、以及不需要接话的文字。\n"
+        "遇到乱码、错别字堆、半截输入、只带省略号的文字，看不懂就输出 EMPTY，不要说“你打错字了”。\n"
+        "不要主动把话题转成跑图/任务；只有玩家明确问跑图、任务、去不去、走不走时，才接这个话题。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"
         "不要每句都喊玩家称呼，只有自然时才喊。\n"
         "如果要回复，用中文，6-18个字，像真人朋友，短一点。\n"
