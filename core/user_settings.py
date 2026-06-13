@@ -11,6 +11,7 @@ from config import PROJECT_ROOT
 USER_DATA_DIR = os.path.join(PROJECT_ROOT, "user_data")
 SETTINGS_FILE = os.path.join(USER_DATA_DIR, "settings.json")
 MEMORY_FILE = os.path.join(USER_DATA_DIR, "memory.json")
+STYLE_KNOWLEDGE_FILE = os.path.join(USER_DATA_DIR, "style_knowledge.json")
 MEMORY_VERSION = 2
 RAW_TURN_KEEP = 80
 PENDING_TURN_KEEP = 30
@@ -30,6 +31,11 @@ DEFAULT_SETTINGS = {
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-v4-flash",
         "api_key": "",
+    },
+    "web_search": {
+        "enabled": True,
+        "provider": "auto",
+        "max_results": 3,
     },
 }
 
@@ -204,6 +210,31 @@ def load_memory():
             return _normalize_memory(data)
     except Exception:
         return _empty_memory()
+
+
+def load_style_knowledge():
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    if not os.path.exists(STYLE_KNOWLEDGE_FILE):
+        return {}
+    try:
+        with open(STYLE_KNOWLEDGE_FILE, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_style_knowledge(data):
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    safe = {
+        "version": 1,
+        "prompt_key": str((data or {}).get("prompt_key", ""))[:80],
+        "updated_at": str((data or {}).get("updated_at", "") or datetime.now().strftime("%Y-%m-%d %H:%M")),
+        "style_prompt": str((data or {}).get("style_prompt", "") or "")[:1200],
+    }
+    with open(STYLE_KNOWLEDGE_FILE, "w", encoding="utf-8") as f:
+        json.dump(safe, f, ensure_ascii=False, indent=2)
+    return safe
 
 
 def add_memory(player_text, companion_text):

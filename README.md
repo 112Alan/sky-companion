@@ -11,6 +11,7 @@
 ```text
 user_data/settings.json
 user_data/memory.json
+user_data/style_knowledge.json
 ```
 
 `user_data/` 已加入 `.gitignore`，不要上传这个目录。
@@ -91,6 +92,20 @@ user_data/memory.json
 ```
 
 下次运行时会读取这段整理后的理解，让伴侣越来越了解使用者。
+
+## 联网搜索
+
+程序内置无 Key 的轻量网页搜索，默认开启：
+
+- 玩家问“今天任务是什么”“复刻是谁”“季节蜡烛在哪”等资料型问题时，才会临时搜索。
+- 普通聊天、跑图邀约、催说话不会触发搜索。
+- 如果性格提示词里写了“病恋/病娇/抖音/参考风格”等，程序会联网搜索公开摘要，整理成一段本地风格参考，保存到：
+
+```text
+user_data/style_knowledge.json
+```
+
+这份风格参考只提炼语气和氛围，不会模仿具体博主，也不会引导现实威胁或控制行为。
 
 ## 项目结构
 

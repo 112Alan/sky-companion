@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
 """Sky Companion - screenshot OCR chat agent."""
-import sys, os, time, re, base64, io, json, subprocess, difflib, requests, numpy as np
+import sys, os, time, re, base64, io, json, subprocess, difflib, hashlib, requests, numpy as np
 from pathlib import Path
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 os.environ["PYTHONIOENCODING"] = "utf-8"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.screen_capture import capture_window, sky_window_foreground, window_exists
 from core.game_controller import activate_sky_window, GameController
+from core.web_search import format_results, search_web
 from core.user_settings import (
   add_memory,
   chat_url,
   ensure_settings,
   load_memory,
+  load_style_knowledge,
   memory_companion_replies,
   memory_needs_update,
   memory_pending_turns,
   memory_prompt,
+  save_style_knowledge,
   update_memory_profile,
 )
 from openai import OpenAI
@@ -29,6 +32,8 @@ LOCAL_OCR_TIMEOUT = 3
 VISION_TIMEOUT = 8
 VISION_FALLBACK_INTERVAL = 8.0
 VISION_FALLBACK_ON_EMPTY = False
+WEB_SEARCH_CACHE_SECONDS = 300
+WEB_SEARCH_TIMEOUT = 4.5
 
 VISION_PROMPT = """You are reading a Sky: Children of the Light screenshot.
 Extract only player chat text from chat bubbles or the opened chat history.
@@ -96,6 +101,8 @@ class SkyCompanionAgent:
     self.chat = self.settings["chat"]
     self.dclient = OpenAI(api_key=self.chat["api_key"], base_url=self.chat["base_url"])
     self.memory = load_memory()
+    self.style_knowledge = load_style_knowledge()
+    self.style_checked = False
     self.my_words = []; self.last_time = 0
     self.prev = None; self.last_text = ""
     self.seen = []; self.last_text = ""
@@ -119,6 +126,7 @@ class SkyCompanionAgent:
     self.last_local_ocr_error_at = 0
     self.memory_updating = False
     self.last_not_foreground_log = 0
+    self.search_cache = {}
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
 
@@ -189,6 +197,167 @@ class SkyCompanionAgent:
       return "聊天跑图都能陪你。"
     if "你在干嘛" in clean:
       return "等你发话呢。"
+    return ""
+
+  def _needs_web_search(self, txt):
+    clean = self._clean_text(txt)
+    if len(clean) < 4:
+      return False
+    if any(x in clean for x in ("去不去任务", "任务去不去", "做任务去不去", "走任务", "跑图不", "跑图吗")):
+      return False
+    explicit = ("搜", "查一下", "上网", "百度", "资料", "攻略", "最新", "新闻")
+    if any(x in txt or x in clean for x in explicit):
+      return True
+    time_words = ("今天", "今日", "现在", "最新", "本周", "明天", "昨天", "这周", "这个月")
+    sky_topics = ("光遇", "任务", "每日", "复刻", "先祖", "季节蜡烛", "大蜡烛", "红石", "黑石", "活动", "兑换图")
+    question_words = ("哪里", "在哪", "怎么", "是什么", "是谁", "什么时候", "几点", "多少", "有啥", "有吗")
+    has_time = any(x in clean for x in time_words)
+    has_sky_topic = any(x in clean for x in sky_topics)
+    has_question = any(x in clean for x in question_words) or "?" in txt or "？" in txt
+    if has_sky_topic and (has_time or has_question):
+      return True
+    general_current = ("价格", "版本", "更新", "公告", "赛程", "天气", "新闻")
+    return has_time and has_question and any(x in clean for x in general_current)
+
+  def _build_search_query(self, txt):
+    clean = str(txt or "").strip()
+    compact = self._clean_text(clean)
+    today = time.strftime("%Y年%m月%d日")
+    month = time.strftime("%Y年%m月")
+    if "复刻" in compact:
+      return ("光遇 " + month + " 最新复刻先祖是谁")[:80]
+    if "季节蜡烛" in compact:
+      return ("光遇 " + today + " 季节蜡烛位置")[:80]
+    if "大蜡烛" in compact:
+      return ("光遇 " + today + " 大蜡烛位置")[:80]
+    if "红石" in compact or "黑石" in compact:
+      return ("光遇 " + today + " 红石黑石位置")[:80]
+    if "任务" in compact and any(x in compact for x in ("今天", "今日", "每日", "最新")):
+      return ("光遇 " + today + " 每日任务")[:80]
+    sky_topics = ("光遇", "任务", "每日", "复刻", "先祖", "季节蜡烛", "大蜡烛", "红石", "黑石", "活动", "兑换图")
+    query = clean
+    if any(x in compact for x in sky_topics) and "光遇" not in compact:
+      query = "光遇 " + query
+    if any(x in compact for x in ("今天", "今日", "最新", "现在")):
+      query = time.strftime("%Y年%m月%d日 ") + query
+    return query[:80]
+
+  def _filter_search_results(self, txt, results):
+    compact = self._clean_text(txt)
+    topic_terms = [t for t in ("光遇", "复刻", "先祖", "任务", "季节蜡烛", "大蜡烛", "红石", "黑石", "活动", "兑换图") if t in compact]
+    if not topic_terms:
+      return results
+    kept = []
+    for item in results:
+      hay = self._clean_text((item.get("title", "") or "") + (item.get("snippet", "") or ""))
+      if any(term in hay for term in topic_terms) or ("光遇" in hay and len(topic_terms) == 1):
+        kept.append(item)
+    return kept
+
+  def _web_search_context(self, txt):
+    config = self.settings.get("web_search", {}) or {}
+    if config.get("enabled") is False:
+      return ""
+    if not self._needs_web_search(txt):
+      return ""
+    query = self._build_search_query(txt)
+    key = self._clean_text(query).lower()
+    now = time.time()
+    cached = self.search_cache.get(key)
+    if cached and now - cached[0] < WEB_SEARCH_CACHE_SECONDS:
+      return cached[1]
+    max_results = int(config.get("max_results") or 3)
+    self._log("Search: " + query[:60])
+    results = search_web(query, max_results=max(1, min(max_results, 5)), timeout=WEB_SEARCH_TIMEOUT)
+    results = self._filter_search_results(txt, results)
+    if not results:
+      self._log("Search: empty")
+      context = "搜索没有拿到可靠结果。"
+    else:
+      self._log("Search: " + str(len(results)) + " results")
+      context = format_results(results)
+    self.search_cache[key] = (now, context)
+    if len(self.search_cache) > 20:
+      old_keys = sorted(self.search_cache, key=lambda k: self.search_cache[k][0])[:5]
+      for old_key in old_keys:
+        self.search_cache.pop(old_key, None)
+    return context
+
+  def _style_prompt_key(self):
+    raw = (self.personality_prompt or "").strip()
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+  def _style_search_queries(self):
+    prompt = self.personality_prompt or ""
+    clean = self._clean_text(prompt)
+    if not clean:
+      return []
+    queries = []
+    if any(x in clean for x in ("病恋", "病娇", "占有欲", "疯批", "偏执")):
+      queries.extend([
+        "病恋 病娇 恋爱 说话风格 文案 抖音",
+        "病娇 占有欲 情感表达 文案 语气",
+      ])
+    if any(x in clean for x in ("虚恋", "恋人", "暧昧", "甜")):
+      queries.append("虚拟恋爱 甜宠 说话风格 文案")
+    if any(x in clean for x in ("虐恋", "拉扯", "破碎感")):
+      queries.append("虐恋 拉扯感 说话风格 文案")
+    if "抖音" in clean and not queries:
+      queries.append(prompt[:50] + " 说话风格 抖音")
+    if any(x in clean for x in ("参考", "学习", "模仿", "风格")) and not queries:
+      queries.append(prompt[:50] + " 说话风格")
+    return queries[:2]
+
+  def _style_context(self):
+    config = self.settings.get("web_search", {}) or {}
+    if config.get("enabled") is False:
+      return ""
+    key = self._style_prompt_key()
+    cached_key = self.style_knowledge.get("prompt_key")
+    cached_prompt = (self.style_knowledge.get("style_prompt") or "").strip()
+    if cached_key == key and cached_prompt:
+      return cached_prompt
+    if self.style_checked:
+      return ""
+    queries = self._style_search_queries()
+    if not queries:
+      self.style_checked = True
+      return ""
+    self.style_checked = True
+    blocks = []
+    for query in queries:
+      self._log("StyleSearch: " + query[:50])
+      results = search_web(query, max_results=3, timeout=WEB_SEARCH_TIMEOUT)
+      if results:
+        blocks.append("搜索：" + query + "\n" + format_results(results))
+    if not blocks:
+      self._log("StyleSearch: empty")
+      return ""
+    try:
+      prompt = (
+        "你是光遇AI伴侣的性格设定整理器。下面是用户写的性格提示词和联网搜索到的公开摘要。\n"
+        "任务：提炼成一段可直接放进聊天提示词的“说话风格参考”。\n"
+        "要求：\n"
+        "1. 只提炼氛围、语气、常见表达，不模仿具体博主，不提来源。\n"
+        "2. 如果是病恋/病娇，只保留虚构角色扮演里的黏人、占有欲、暧昧拉扯和安全边界。\n"
+        "3. 禁止现实威胁、恐吓、自残、控制玩家现实生活、诱导依赖。\n"
+        "4. 适合光遇游戏聊天，短句，口语，120字以内。\n\n"
+        "用户性格提示词：\n" + self.personality_prompt + "\n\n"
+        "联网摘要：\n" + "\n\n".join(blocks)
+      )
+      r = self._chat_completion(prompt, temperature=0.35, max_tokens=260)
+      ans = r.choices[0].message.content.strip() if r.choices else ""
+      ans = re.sub(r"^```(?:text|markdown)?\s*|\s*```$", "", ans, flags=re.I | re.S).strip()
+      if len(ans) >= 10:
+        self.style_knowledge = save_style_knowledge({
+          "prompt_key": key,
+          "style_prompt": ans,
+          "updated_at": time.strftime("%Y-%m-%d %H:%M"),
+        })
+        self._log("StyleSearch: updated")
+        return ans
+    except Exception as e:
+      self._log("StyleSearch: " + str(e)[:60])
     return ""
 
   def _is_noise_text(self, txt):
@@ -990,12 +1159,18 @@ class SkyCompanionAgent:
     if not txt: return ""
     try:
       recent = " | ".join(self.my_words[-4:])
+      search_context = self._web_search_context(txt)
+      style_context = self._style_context()
+      style_block = ("联网风格参考：\n" + style_context + "\n") if style_context else ""
+      search_block = ("联网搜索结果：\n" + search_context + "\n") if search_context else ""
       p = (
         "你的名字是" + self.companion_name + "。你是光遇里的真人朋友，不是工具。\n"
         "玩家在光遇里的称呼/备注名是：" + self.user_call_name + "\n"
         "你的性格提示词：" + self.personality_prompt + "\n"
+        + style_block +
         "长期记忆：\n" + memory_prompt(self.memory) + "\n"
         "最近对话：\n" + self._recent_dialogue_prompt() + "\n"
+        + search_block +
         "下面给你的是当前屏幕上识别到的白色中文字列表，里面可能混着聊天、UI、活动标题、物品名、玩家备注、你自己刚说过的话。\n"
         "你要先从列表里判断有没有“玩家最新对你说的话”。如果没有，就输出 EMPTY。\n"
         "只有当玩家在跟你打招呼、问你、喊你、接你的话、给你指令、或上下文自然需要回应时才回复。\n"
@@ -1005,6 +1180,8 @@ class SkyCompanionAgent:
         "忽略系统文字、物品/活动标题、残缺半句、备注名、自己刚说的话、以及不需要接话的文字。\n"
         "遇到乱码、错别字堆、半截输入、只带省略号的文字，看不懂就输出 EMPTY，不要说“你打错字了”。\n"
         "不要主动把话题转成跑图/任务；只有玩家明确问跑图、任务、去不去、走不走时，才接这个话题。\n"
+        "如果有联网搜索结果，只在它和玩家问题相关时使用；不确定就说没查准，不要编造。\n"
+        "搜索类问题可以回复到35字；普通聊天仍保持6-18字。\n"
         "如果前后文看起来已经回过了，也输出 EMPTY。\n"
         "不要每句都喊玩家称呼，只有自然时才喊。\n"
         "如果要回复，用中文，6-18个字，像真人朋友，短一点。\n"
