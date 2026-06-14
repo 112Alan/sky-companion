@@ -10,6 +10,7 @@ from config import PROJECT_ROOT
 
 USER_DATA_DIR = os.path.join(PROJECT_ROOT, "user_data")
 SETTINGS_FILE = os.path.join(USER_DATA_DIR, "settings.json")
+QUICK_CONFIG_FILE = os.path.join(USER_DATA_DIR, "小懒快速配置.txt")
 MEMORY_FILE = os.path.join(USER_DATA_DIR, "memory.json")
 STYLE_KNOWLEDGE_FILE = os.path.join(USER_DATA_DIR, "style_knowledge.json")
 SEARCH_KNOWLEDGE_FILE = os.path.join(USER_DATA_DIR, "search_knowledge.json")
@@ -21,6 +22,7 @@ SEARCH_KNOWLEDGE_KEEP = 40
 DEFAULT_SETTINGS = {
     "companion_name": "",
     "user_call_name": "",
+    "require_user_recognition": None,
     "personality_prompt": "",
     "vision": {
         "provider": "local_ocr",
@@ -70,6 +72,99 @@ def save_settings(settings):
     os.makedirs(USER_DATA_DIR, exist_ok=True)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, ensure_ascii=False, indent=2)
+
+
+def _yes_no(value, default=False):
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if not text:
+        return default
+    return text in ("y", "yes", "1", "true", "是", "需要", "开", "开启", "启用")
+
+
+def _yes_no_text(value):
+    return "是" if _yes_no(value, False) else "否"
+
+
+def write_quick_config(settings):
+    os.makedirs(USER_DATA_DIR, exist_ok=True)
+    text = (
+        "当前称呼：" + str(settings.get("companion_name", "") or "") + "\n\n"
+        "使用者称呼：" + str(settings.get("user_call_name", "") or "") + "\n\n"
+        "是否需要识别使用者：" + _yes_no_text(settings.get("require_user_recognition", False)) + "\n\n"
+        "当前性格：\n" + str(settings.get("personality_prompt", "") or "").strip() + "\n"
+    )
+    with open(QUICK_CONFIG_FILE, "w", encoding="utf-8") as f:
+        f.write(text)
+    return QUICK_CONFIG_FILE
+
+
+def _field_before_next_label(text, label, following_labels):
+    marker = label + "："
+    if marker not in text:
+        return None
+    start = text.index(marker) + len(marker)
+    end = len(text)
+    for next_label in following_labels:
+        next_marker = "\n" + next_label + "："
+        pos = text.find(next_marker, start)
+        if pos >= 0:
+            end = min(end, pos)
+    return text[start:end].strip()
+
+
+def load_quick_config_values():
+    if not os.path.exists(QUICK_CONFIG_FILE):
+        return {}
+    try:
+        with open(QUICK_CONFIG_FILE, "r", encoding="utf-8-sig") as f:
+            text = f.read()
+    except Exception:
+        return {}
+    labels = ["当前称呼", "使用者称呼", "是否需要识别使用者", "当前性格"]
+    values = {}
+    companion = _field_before_next_label(text, "当前称呼", labels[1:])
+    user = _field_before_next_label(text, "使用者称呼", labels[2:])
+    recog = _field_before_next_label(text, "是否需要识别使用者", labels[3:])
+    personality = _field_before_next_label(text, "当前性格", [])
+    if companion is not None:
+        values["companion_name"] = companion.splitlines()[0].strip()
+    if user is not None:
+        values["user_call_name"] = user.splitlines()[0].strip()
+    if recog is not None:
+        values["require_user_recognition"] = _yes_no(recog, False)
+    if personality is not None:
+        values["personality_prompt"] = personality.strip()
+    return values
+
+
+def quick_config_mtime():
+    try:
+        return os.path.getmtime(QUICK_CONFIG_FILE)
+    except OSError:
+        return 0
+
+
+def sync_quick_config(settings):
+    settings = _deep_merge(DEFAULT_SETTINGS, settings)
+    if os.path.exists(QUICK_CONFIG_FILE):
+        values = load_quick_config_values()
+        changed = False
+        for key, value in values.items():
+            if key in ("companion_name", "user_call_name", "personality_prompt") and value:
+                if settings.get(key) != value:
+                    settings[key] = value
+                    changed = True
+            elif key == "require_user_recognition":
+                if bool(settings.get(key)) != bool(value):
+                    settings[key] = bool(value)
+                    changed = True
+        if changed:
+            save_settings(settings)
+    else:
+        write_quick_config(settings)
+    return settings
 
 
 def _ask(prompt, default=""):
@@ -161,6 +256,13 @@ def ensure_settings():
             settings["personality_prompt"] = "像光遇里的真实朋友一样自然聊天，大白话，回复短一点。"
         save_settings(settings)
 
+    if settings.get("require_user_recognition") is None:
+        ans = input("是否需要识别使用者？需要输入 是，不需要输入 否 [是]: ").strip()
+        settings["require_user_recognition"] = not ans or _yes_no(ans, True)
+        save_settings(settings)
+
+    settings = sync_quick_config(settings)
+    write_quick_config(settings)
     return settings
 
 

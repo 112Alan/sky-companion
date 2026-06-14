@@ -22,6 +22,8 @@ from core.user_settings import (
   memory_prompt,
   search_knowledge_prompt,
   save_style_knowledge,
+  quick_config_mtime,
+  sync_quick_config,
   update_memory_profile,
 )
 from openai import OpenAI
@@ -51,9 +53,10 @@ SELF_ECHO_WINDOW = 30.0
 DISTORTED_ECHO_WINDOW = 15.0
 OCR_MIN_INTERVAL = 0.6
 ECHO_BACKOFF = 2.0
-MSG_STABLE_SECONDS = 1.15
+MSG_STABLE_SECONDS = 0.9
 ELLIPSIS_STABLE_SECONDS = 2.2
-REPLY_COOLDOWN = 1.2
+REPLY_COOLDOWN = 0.85
+CHAT_PANEL_CHECK_INTERVAL = 1.6
 CHANGE_THRESHOLD = 10
 DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
 OCR_GARBAGE_CHARS = set("卩厶艹丶丿丨亅乀乁乛冫冖冂亠乚龴彡彳灬攵犭礻衤讠钅阝饣忄扌氵殄咿忡吣吢杓唥竄孓")
@@ -62,12 +65,13 @@ UI_TEXT_HINTS = [
   "狂欢", "狂欢季", "季节", "先祖", "编钟", "任务", "活动", "礼包", "商店", "蜡烛",
   "爱心", "斗篷", "发型", "面具", "乐器", "兑换", "领取", "剩余", "点击",
   "好友解除", "已经与此好友解除", "现已开启", "新任务", "设置", "确定", "取消",
+  "聊天", "发送", "按Enter聊天", "Enter聊天",
 ]
-UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故", "接", "看", "没", "设", "君", "Z", "z"]
+UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故", "接", "看", "没", "设", "君", "聊天", "发送", "Z", "z"]
 CHAT_HINTS = [
   "你好", "哈喽", "嗨", "早上好", "晚上好", "晚安", "在吗", "走", "来", "去",
   "你", "我", "咱", "我们", "怎么", "为什么", "什么", "哪", "喊", "吗", "呢",
-  "谁", "咋", "干嘛", "会什么", "不去", "说话", "回话", "理我", "不说话", "哑巴",
+  "谁", "咋", "啥", "是什么", "什么意思", "啥意思", "什么梗", "干嘛", "会什么", "不去", "说话", "回话", "理我", "不说话", "哑巴",
   "别", "服", "烦", "笑死", "好笑", "人机", "真人", "禁言", "讲人话", "转人工",
   "草", "靠", "无语", "救命", "行", "好",
   "？", "?", "！", "!",
@@ -77,6 +81,7 @@ STRONG_CHAT_HINTS = [
   "走啊", "来吗", "去吗", "去不去", "做任务", "跑图", "说话", "回话",
   "理我", "不说话", "哑巴", "你是谁", "你在干嘛", "你会什么",
   "我服", "笑死", "无语", "救命", "怎么", "为什么", "干嘛", "什么",
+  "啥", "是什么", "什么意思", "啥意思", "什么梗",
   "好笑", "好好笑", "人机", "真人", "禁言", "讲人话", "转人工", "转人", "带我",
   "？", "?", "！", "!",
 ]
@@ -101,6 +106,7 @@ class SkyCompanionAgent:
       raise SystemExit(1)
     self.companion_name = self.settings["companion_name"]
     self.user_call_name = self.settings.get("user_call_name", "")
+    self.require_user_recognition = bool(self.settings.get("require_user_recognition", False))
     self.personality_prompt = self.settings.get("personality_prompt", "")
     self.vision = self.settings["vision"]
     self.chat = self.settings["chat"]
@@ -134,8 +140,28 @@ class SkyCompanionAgent:
     self.memory_updating = False
     self.last_not_foreground_log = 0
     self.search_cache = {}
+    self.quick_config_mtime = quick_config_mtime()
+    self.last_quick_config_check = 0
+    self.chat_panel_missing_count = 0
+    self.last_chat_panel_check = 0
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
+
+  def _reload_quick_config_if_changed(self):
+    now = time.time()
+    if now - self.last_quick_config_check < 1.5:
+      return
+    self.last_quick_config_check = now
+    mtime = quick_config_mtime()
+    if not mtime or mtime == self.quick_config_mtime:
+      return
+    self.settings = sync_quick_config(self.settings)
+    self.quick_config_mtime = quick_config_mtime()
+    self.companion_name = self.settings.get("companion_name", self.companion_name)
+    self.user_call_name = self.settings.get("user_call_name", self.user_call_name)
+    self.require_user_recognition = bool(self.settings.get("require_user_recognition", False))
+    self.personality_prompt = self.settings.get("personality_prompt", self.personality_prompt)
+    self._log("Config: quick updated")
 
   def _same(self, a, b):
     """判断两条文字是否相似（忽略标点）"""
@@ -163,6 +189,103 @@ class SkyCompanionAgent:
       "丨": "",
     })
     return txt.translate(table)
+
+  def _split_message_remark(self, line):
+    raw = re.sub(r"\s+", "", str(line or "")).strip()
+    if not raw:
+      return "", ""
+    match = re.search(r"[-－—–~～|丨]([\u4e00-\u9fffA-Za-z0-9_]{1,18})$", raw)
+    if not match:
+      return raw, ""
+    msg = raw[:match.start()].strip()
+    remark = match.group(1).strip()
+    if len(self._clean_text(msg)) < 1 or len(self._clean_text(remark)) < 1:
+      return raw, ""
+    return msg, remark
+
+  def _speaker_is_user(self, remark):
+    user = self._clean_text(self.user_call_name)
+    speaker = self._clean_text(remark)
+    if not user or not speaker:
+      return False
+    if speaker == user:
+      return True
+    if len(user) >= 2 and len(speaker) >= 2 and abs(len(user) - len(speaker)) <= 2:
+      return user in speaker or speaker in user
+    return False
+
+  def _line_for_allowed_user(self, line):
+    if not self.require_user_recognition:
+      return line
+    msg, remark = self._split_message_remark(line)
+    if not remark:
+      return ""
+    if not self._speaker_is_user(remark):
+      return ""
+    return msg
+
+  def _chat_panel_state_from_lines(self, raw_lines):
+    text = "\n".join(str(line or "") for line in raw_lines or [])
+    clean = self._clean_text(text)
+    if "发送" in clean:
+      return "send"
+    if "聊天" in clean or "Enter聊天" in text or "ENTER聊天" in text.upper():
+      return "chat"
+    if any(self._split_message_remark(line)[1] for line in raw_lines or []):
+      return "open"
+    return "closed"
+
+  def _ensure_chat_panel_open(self, shot=None, local=None):
+    if not self.require_user_recognition:
+      return local
+    now = time.time()
+    if now - self.last_chat_panel_check < CHAT_PANEL_CHECK_INTERVAL and local is None:
+      return local
+    self.last_chat_panel_check = now
+    if local is None:
+      local = self._do_local_ocr(shot or capture_window())
+    state = self._chat_panel_state_from_lines(local.get("raw_lines", []))
+    if state == "closed":
+      self.chat_panel_missing_count += 1
+      if self.chat_panel_missing_count >= 2:
+        try:
+          import keyboard
+          activate_sky_window()
+          keyboard.press_and_release("c")
+          self._log("Chat: open panel")
+          time.sleep(0.25)
+          self.chat_panel_missing_count = 0
+        except Exception as e:
+          self._log("Chat: " + str(e)[:50])
+    else:
+      self.chat_panel_missing_count = 0
+    return local
+
+  def _send_chat_text(self, text):
+    if not self.require_user_recognition:
+      ctrl.send_chat_message(text)
+      return
+    import keyboard
+    activate_sky_window()
+    time.sleep(0.15)
+    state = "closed"
+    shot = capture_window()
+    if shot:
+      local = self._do_local_ocr(shot)
+      state = self._chat_panel_state_from_lines(local.get("raw_lines", []))
+    if state == "closed":
+      keyboard.press_and_release("c")
+      time.sleep(0.25)
+      shot = capture_window()
+      if shot:
+        local = self._do_local_ocr(shot)
+        state = self._chat_panel_state_from_lines(local.get("raw_lines", []))
+    if state in ("chat", "open", "closed"):
+      keyboard.press_and_release("enter")
+      time.sleep(0.18)
+    keyboard.write(text, delay=0.01)
+    time.sleep(0.08)
+    keyboard.press_and_release("enter")
 
   def _has_ellipsis_tail(self, txt):
     return bool(re.search(r"(\.{2,}|…+|。{2,}|[，,、·丶]{2,})\s*$", str(txt or "")))
@@ -352,6 +475,8 @@ class SkyCompanionAgent:
       ])
     if any(x in clean for x in ("虚恋", "恋人", "暧昧", "甜")):
       queries.append("虚拟恋爱 甜宠 说话风格 文案")
+    if any(x in clean for x in ("人机恋", "克劳德", "Claude", "活人感", "陪伴")):
+      queries.append("Claude 人机恋 活人感 恋爱陪伴 说话风格")
     if any(x in clean for x in ("虐恋", "拉扯", "破碎感")):
       queries.append("虐恋 拉扯感 说话风格 文案")
     if "抖音" in clean and not queries:
@@ -749,6 +874,9 @@ class SkyCompanionAgent:
       line = line.strip()
       if not line:
         continue
+      line = self._line_for_allowed_user(line)
+      if not line:
+        continue
       clean = self._clean_text(line)
       if not clean:
         continue
@@ -788,6 +916,9 @@ class SkyCompanionAgent:
     kept = []
     for line in (txt or "").split("\n"):
       line = line.strip()
+      if not line:
+        continue
+      line = self._line_for_allowed_user(line)
       if not line:
         continue
       clean = self._clean_text(line)
@@ -960,10 +1091,13 @@ class SkyCompanionAgent:
 
   def _local_ocr_regions(self, image):
     w, h = image.size
-    return [
+    regions = [
       self._make_region(w, h, (0.02, 0.10, 0.78, 0.86)),
       self._make_region(w, h, (0.12, 0.08, 0.96, 0.80)),
     ]
+    if self.require_user_recognition:
+      regions.append(self._make_region(w, h, (0.02, 0.72, 0.98, 0.98)))
+    return regions
 
   def _enhance_local_ocr_crop(self, crop):
     crop = crop.convert("RGB")
@@ -1250,8 +1384,7 @@ class SkyCompanionAgent:
       return False
 
     self._log("Say: " + reply[:50])
-    activate_sky_window(); time.sleep(0.3)
-    ctrl.send_chat_message(reply[:60])
+    self._send_chat_text(reply[:60])
     self.my_words.append(reply)
     self.last_sent_text = reply
     self.last_sent_at = time.time()
@@ -1359,6 +1492,7 @@ class SkyCompanionAgent:
         "你的名字是" + self.companion_name + "。你是光遇里的真人朋友，不是工具。\n"
         "玩家在光遇里的称呼/备注名是：" + self.user_call_name + "\n"
         "你的性格提示词：" + self.personality_prompt + "\n"
+        "关系递进规则：刚认识或上下文不熟时要克制、自然、有分寸，像聪明温柔但有一点小脾气的朋友；不要一上来强烈病恋、占有欲爆棚或发癫。只有长期记忆显示你们已经熟悉，才逐步增加暧昧、拉扯、陪伴感和轻微依恋。始终禁止现实控制、威胁、自残、道德绑架。\n"
         + style_block +
         "长期记忆：\n" + memory_prompt(self.memory) + "\n"
         + learned_search_block +
@@ -1408,6 +1542,7 @@ class SkyCompanionAgent:
     while True:
       try:
         time.sleep(0.3)
+        self._reload_quick_config_if_changed()
         # 刚发完消息时，画面里的聊天气泡大概率是自己的回声，先短暂静默。
         if time.time() - self.last_sent_at < SELF_ECHO_SILENCE:
           continue
@@ -1446,7 +1581,11 @@ class SkyCompanionAgent:
         if not self._changed(shot): continue
 
         # 画面变了，OCR获取当前文字
-        now = self._do_ocr(shot)
+        local = self._ensure_chat_panel_open(shot) if self.require_user_recognition else None
+        if local and local.get("available"):
+          now = local.get("text", "")
+        else:
+          now = self._do_ocr(shot)
         self.next_ocr_at = time.time() + OCR_MIN_INTERVAL
         if not now:
           self.empty_ocr_count += 1
