@@ -223,6 +223,7 @@ DSHTTP: ...
 - API Key 是否来自 DeepSeek 官方平台
 - 账号是否还有余额
 - 程序是否已经更新到支持 V4 thinking 参数的版本
+- 新版对 DeepSeek 官方接口使用直连 HTTP 请求，不依赖本机 OpenAI SDK 版本
 
 如果仍然报错，把 `DSHTTP:` 后面的错误内容发给维护者，不要截图或发送自己的完整 API Key。
 

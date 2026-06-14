@@ -2,6 +2,7 @@
 """Sky Companion - screenshot OCR chat agent."""
 import sys, os, time, re, base64, io, json, subprocess, difflib, hashlib, requests, numpy as np
 from pathlib import Path
+from types import SimpleNamespace
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 os.environ["PYTHONIOENCODING"] = "utf-8"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1420,8 +1421,45 @@ class SkyCompanionAgent:
     msg = re.sub(r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer ***", msg, flags=re.I)
     return msg[:180]
 
+  def _use_direct_deepseek_http(self):
+    base = str(self.chat.get("base_url", "")).lower()
+    provider = str(self.chat.get("provider", "")).lower()
+    return "api.deepseek.com" in base or provider == "deepseek"
+
+  def _chat_completion_http(self, prompt, temperature=0.9, max_tokens=60):
+    url = chat_url(self.chat.get("base_url", ""))
+    model = str(self.chat.get("model", "")).strip()
+    payload = {
+      "model": model,
+      "messages": [{"role": "user", "content": prompt}],
+      "temperature": temperature,
+      "max_tokens": max_tokens,
+    }
+    extra_body = self._chat_extra_body()
+    if extra_body:
+      payload.update(extra_body)
+    headers = {
+      "Authorization": "Bearer " + str(self.chat.get("api_key", "")).strip(),
+      "Content-Type": "application/json",
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=25)
+    if resp.status_code >= 400:
+      raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:1000]}")
+    data = resp.json()
+    choices = []
+    for item in data.get("choices", []):
+      msg = item.get("message") or {}
+      choices.append(SimpleNamespace(message=SimpleNamespace(content=msg.get("content") or "")))
+    return SimpleNamespace(choices=choices, raw=data)
+
   def _chat_completion(self, prompt, temperature=0.9, max_tokens=60):
     model = str(self.chat.get("model", "")).strip()
+    if self._use_direct_deepseek_http():
+      try:
+        return self._chat_completion_http(prompt, temperature=temperature, max_tokens=max_tokens)
+      except Exception as e:
+        self._log("DSHTTP: " + self._format_api_error(e))
+        raise
     kwargs = {
       "model": model,
       "messages": [{"role": "user", "content": prompt}],
