@@ -83,6 +83,14 @@ start_sky.bat
 
 可选视觉模型兜底默认关闭。正常使用只走本地 OCR 和 DeepSeek。
 
+`deepseek-v4-pro` 是 DeepSeek 官方 API 支持的模型名，接口地址仍然使用：
+
+```text
+https://api.deepseek.com
+```
+
+程序会为 V4 模型关闭官方 thinking 输出，让光遇内短回复更快、更稳定。
+
 ## 使用者识别
 
 如果开启“需要识别使用者”，程序会按光遇聊天记录里的后缀判断是谁说的话：
@@ -198,6 +206,25 @@ OCR: empty
 - 光遇窗口没有最小化，聊天文字在截图里清楚可见
 - PowerShell/OBS/别的窗口没有挡住光遇聊天区域
 - 光遇文字太小或太暗时，可以把游戏窗口放大一点
+
+## DS Error code: 400 怎么办
+
+如果日志出现：
+
+```text
+DS: Error code: 400
+DSHTTP: ...
+```
+
+说明 DeepSeek 收到了请求，但请求格式或账号状态不符合要求。优先检查：
+
+- 模型名是否是 `deepseek-v4-pro` 或 `deepseek-v4-flash`
+- 接口网址是否是 `https://api.deepseek.com`
+- API Key 是否来自 DeepSeek 官方平台
+- 账号是否还有余额
+- 程序是否已经更新到支持 V4 thinking 参数的版本
+
+如果仍然报错，把 `DSHTTP:` 后面的错误内容发给维护者，不要截图或发送自己的完整 API Key。
 
 ## License
 

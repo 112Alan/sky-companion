@@ -1404,13 +1404,26 @@ class SkyCompanionAgent:
   def _chat_extra_body(self):
     model = str(self.chat.get("model", "")).lower()
     base = str(self.chat.get("base_url", "")).lower()
-    if ("deepseek" in model or "deepseek" in base) and "flash" in model:
+    if ("deepseek" in model or "deepseek" in base) and ("v4" in model or "flash" in model):
       return {"thinking": {"type": "disabled"}}
     return None
 
+  def _format_api_error(self, err):
+    msg = str(err)
+    try:
+      body = getattr(getattr(err, "response", None), "text", "")
+      if body:
+        msg = msg + " | " + body
+    except Exception:
+      pass
+    msg = re.sub(r"sk-[A-Za-z0-9_\-]+", "sk-***", msg)
+    msg = re.sub(r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer ***", msg, flags=re.I)
+    return msg[:180]
+
   def _chat_completion(self, prompt, temperature=0.9, max_tokens=60):
+    model = str(self.chat.get("model", "")).strip()
     kwargs = {
-      "model": self.chat["model"],
+      "model": model,
       "messages": [{"role": "user", "content": prompt}],
       "temperature": temperature,
       "max_tokens": max_tokens,
@@ -1418,7 +1431,11 @@ class SkyCompanionAgent:
     extra_body = self._chat_extra_body()
     if extra_body:
       kwargs["extra_body"] = extra_body
-    return self.dclient.chat.completions.create(**kwargs)
+    try:
+      return self.dclient.chat.completions.create(**kwargs)
+    except Exception as e:
+      self._log("DSHTTP: " + self._format_api_error(e))
+      raise
 
   def _clean_memory_summary(self, txt):
     txt = (txt or "").strip()
