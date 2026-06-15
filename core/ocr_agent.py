@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Sky Companion - screenshot OCR chat agent."""
-import sys, os, time, re, base64, io, json, subprocess, difflib, hashlib, requests, numpy as np
+import sys, os, time, re, base64, io, json, subprocess, difflib, hashlib, threading, queue, requests, numpy as np
 from pathlib import Path
 from types import SimpleNamespace
 from PIL import Image, ImageOps, ImageEnhance, ImageFilter
@@ -30,11 +30,14 @@ from core.user_settings import (
 from openai import OpenAI
 
 ctrl = GameController()
+AGENT_BUILD = "2026-06-15-fastocr2"
 
 APP_DIR = Path(__file__).resolve().parents[1]
 LOCAL_OCR_SCRIPT = APP_DIR / "windows_ocr.ps1"
+LOCAL_OCR_SERVER_SCRIPT = APP_DIR / "windows_ocr_server.ps1"
 LOCAL_OCR_IMAGE = APP_DIR / "outputs" / "ocr_latest.jpg"
-LOCAL_OCR_TIMEOUT = 3
+LOCAL_OCR_TIMEOUT = 1.4
+LOCAL_OCR_SERVER_TIMEOUT = 1.05
 VISION_TIMEOUT = 8
 VISION_FALLBACK_INTERVAL = 8.0
 VISION_FALLBACK_ON_EMPTY = False
@@ -52,12 +55,15 @@ If there is no clear player chat message, return EMPTY."""
 SELF_ECHO_SILENCE = 2.0
 SELF_ECHO_WINDOW = 30.0
 DISTORTED_ECHO_WINDOW = 15.0
-OCR_MIN_INTERVAL = 0.6
+OCR_MIN_INTERVAL = 0.22
 ECHO_BACKOFF = 2.0
-MSG_STABLE_SECONDS = 0.9
-ELLIPSIS_STABLE_SECONDS = 2.2
-REPLY_COOLDOWN = 0.85
+MSG_STABLE_SECONDS = 0.35
+ELLIPSIS_STABLE_SECONDS = 0.9
+REPLY_COOLDOWN = 0.55
 CHAT_PANEL_CHECK_INTERVAL = 1.6
+CHAT_PANEL_REOPEN_COOLDOWN = 12.0
+CHAT_PANEL_OPEN_GRACE = 45.0
+CHAT_PANEL_MISSING_THRESHOLD = 3
 CHANGE_THRESHOLD = 10
 DEFAULT_IGNORE_REMARKS = ["大号", "小号", "好友", "备注", "主人"]
 OCR_GARBAGE_CHARS = set("卩厶艹丶丿丨亅乀乁乛冫冖冂亠乚龴彡彳灬攵犭礻衤讠钅阝饣忄扌氵殄咿忡吣吢杓唥竄孓")
@@ -66,7 +72,7 @@ UI_TEXT_HINTS = [
   "狂欢", "狂欢季", "季节", "先祖", "编钟", "任务", "活动", "礼包", "商店", "蜡烛",
   "爱心", "斗篷", "发型", "面具", "乐器", "兑换", "领取", "剩余", "点击",
   "好友解除", "已经与此好友解除", "现已开启", "新任务", "设置", "确定", "取消",
-  "聊天", "发送", "按Enter聊天", "Enter聊天",
+  "聊天", "发送", "按Enter聊天", "Enter聊天", "长按", "呼出鼠标", "切换飞行模式", "飞行模式",
 ]
 UI_EXACT_TEXTS = ["光遇", "号", "现", "现在", "狂", "造", "故", "接", "看", "没", "设", "君", "聊天", "发送", "Z", "z"]
 CHAT_HINTS = [
@@ -98,6 +104,7 @@ NON_CHAT_SUBSTRINGS = [
   "模型", "接口", "配置", "版本", "视觉", "本地", "DeepSeek", "Gemini",
   "回复一条", "这一套", "GitHub", "截图", "识别", "中转站",
   "同步", "密钥", "扫描", "工作副本", "提交", "推到", "视频", "开发", "桌宠", "分析",
+  "长按", "呼出鼠标", "隐藏鼠标", "切换飞行模式", "飞行模式",
 ]
 
 class SkyCompanionAgent:
@@ -145,8 +152,84 @@ class SkyCompanionAgent:
     self.last_quick_config_check = 0
     self.chat_panel_missing_count = 0
     self.last_chat_panel_check = 0
+    self.last_chat_panel_toggle = 0
+    self.chat_panel_assumed_open_until = 0
+    self.local_ocr_proc = None
+    self.local_ocr_queue = None
+    self.local_ocr_server_failed = False
+    self.local_ocr_seq = 0
+    self.last_ocr_debug_save = 0
 
   def _log(self, m): print(f"[{time.strftime('%H:%M:%S')}] {m}")
+
+  def _stop_local_ocr_server(self):
+    proc = self.local_ocr_proc
+    self.local_ocr_proc = None
+    self.local_ocr_queue = None
+    if proc:
+      try:
+        proc.kill()
+      except Exception:
+        pass
+
+  def _ensure_local_ocr_server(self):
+    if self.local_ocr_server_failed or not LOCAL_OCR_SERVER_SCRIPT.exists():
+      return None
+    if self.local_ocr_proc and self.local_ocr_proc.poll() is None:
+      return self.local_ocr_proc
+    try:
+      creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+      proc = subprocess.Popen(
+        [
+          "powershell.exe",
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          str(LOCAL_OCR_SERVER_SCRIPT),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        creationflags=creationflags,
+      )
+      q = queue.Queue()
+
+      def reader():
+        try:
+          for line in proc.stdout:
+            q.put(line)
+        except Exception:
+          pass
+
+      threading.Thread(target=reader, daemon=True).start()
+      self.local_ocr_proc = proc
+      self.local_ocr_queue = q
+      return proc
+    except Exception:
+      self.local_ocr_server_failed = True
+      return None
+
+  def _run_local_ocr_server(self, image_path):
+    proc = self._ensure_local_ocr_server()
+    if not proc or not self.local_ocr_queue:
+      return None
+    try:
+      while True:
+        self.local_ocr_queue.get_nowait()
+    except queue.Empty:
+      pass
+    try:
+      proc.stdin.write(str(image_path) + "\n")
+      proc.stdin.flush()
+      return self.local_ocr_queue.get(timeout=LOCAL_OCR_SERVER_TIMEOUT).strip()
+    except Exception:
+      self._stop_local_ocr_server()
+      return None
 
   def _reload_quick_config_if_changed(self):
     now = time.time()
@@ -195,7 +278,7 @@ class SkyCompanionAgent:
     raw = re.sub(r"\s+", "", str(line or "")).strip()
     if not raw:
       return "", ""
-    match = re.search(r"[-－—–~～|丨]([\u4e00-\u9fffA-Za-z0-9_]{1,18})$", raw)
+    match = re.search(r"[-－—–~～|丨:：/\\·•．.。、]+([\u4e00-\u9fffA-Za-z0-9_]{1,18})$", raw)
     if not match:
       return raw, ""
     msg = raw[:match.start()].strip()
@@ -213,17 +296,45 @@ class SkyCompanionAgent:
       return True
     if len(user) >= 2 and len(speaker) >= 2 and abs(len(user) - len(speaker)) <= 2:
       return user in speaker or speaker in user
+    if len(user) >= 2 and len(speaker) >= 2:
+      return difflib.SequenceMatcher(None, user, speaker).ratio() >= 0.68
     return False
+
+  def _speaker_fragment_can_be_user(self, remark, msg):
+    """OCR sometimes drops the first char of the configured remark: 大号 -> 号."""
+    user = self._clean_text(self.user_call_name)
+    speaker = self._clean_text(remark)
+    message = self._clean_text(msg)
+    if len(user) < 2 or len(speaker) != 1 or len(message) < 2:
+      return False
+    if speaker not in user:
+      return False
+    if self._looks_like_non_chat_line(msg) or self._looks_like_ocr_garbage(msg):
+      return False
+    return True
+
+  def _extract_allowed_user_message(self, line):
+    msg, remark = self._split_message_remark(line)
+    if remark and (self._speaker_is_user(remark) or self._speaker_fragment_can_be_user(remark, msg)):
+      return msg
+    user = self._clean_text(self.user_call_name)
+    clean = self._clean_text(line)
+    if not user or not clean or clean == user:
+      return ""
+    if clean.endswith(user) and len(clean) > len(user):
+      return clean[:-len(user)].strip()
+    start = max(1, len(clean) - len(user) - 2)
+    for index in range(start, len(clean)):
+      msg_part = clean[:index].strip()
+      speaker_part = clean[index:].strip()
+      if msg_part and self._speaker_is_user(speaker_part):
+        return msg_part
+    return ""
 
   def _line_for_allowed_user(self, line):
     if not self.require_user_recognition:
       return line
-    msg, remark = self._split_message_remark(line)
-    if not remark:
-      return ""
-    if not self._speaker_is_user(remark):
-      return ""
-    return msg
+    return self._extract_allowed_user_message(line)
 
   def _chat_panel_state_from_lines(self, raw_lines):
     text = "\n".join(str(line or "") for line in raw_lines or [])
@@ -232,9 +343,35 @@ class SkyCompanionAgent:
       return "send"
     if "聊天" in clean or "Enter聊天" in text or "ENTER聊天" in text.upper():
       return "chat"
+    if any(self._extract_allowed_user_message(line) for line in raw_lines or []):
+      return "open"
     if any(self._split_message_remark(line)[1] for line in raw_lines or []):
       return "open"
     return "closed"
+
+  def _paste_or_type(self, text):
+    import keyboard
+    copied = False
+    try:
+      import tkinter as tk
+      root = tk.Tk()
+      root.withdraw()
+      root.clipboard_clear()
+      root.clipboard_append(text)
+      root.update()
+      root.destroy()
+      copied = True
+    except Exception:
+      try:
+        import pyperclip
+        pyperclip.copy(text)
+        copied = True
+      except Exception:
+        copied = False
+    if copied:
+      keyboard.press_and_release("ctrl+v")
+    else:
+      keyboard.write(text, delay=0.01)
 
   def _ensure_chat_panel_open(self, shot=None, local=None):
     if not self.require_user_recognition:
@@ -246,15 +383,26 @@ class SkyCompanionAgent:
     if local is None:
       local = self._do_local_ocr(shot or capture_window())
     state = self._chat_panel_state_from_lines(local.get("raw_lines", []))
-    if state == "closed":
+    if state in ("open", "send"):
+      self.chat_panel_missing_count = 0
+      self.chat_panel_assumed_open_until = now + CHAT_PANEL_OPEN_GRACE
+      return local
+    if now < self.chat_panel_assumed_open_until:
+      return local
+    if state in ("closed", "chat"):
       self.chat_panel_missing_count += 1
-      if self.chat_panel_missing_count >= 2:
+      if (
+        self.chat_panel_missing_count >= CHAT_PANEL_MISSING_THRESHOLD
+        and now - self.last_chat_panel_toggle >= CHAT_PANEL_REOPEN_COOLDOWN
+      ):
         try:
           import keyboard
           activate_sky_window()
           keyboard.press_and_release("c")
           self._log("Chat: open panel")
           time.sleep(0.25)
+          self.last_chat_panel_toggle = time.time()
+          self.chat_panel_assumed_open_until = self.last_chat_panel_toggle + CHAT_PANEL_OPEN_GRACE
           self.chat_panel_missing_count = 0
         except Exception as e:
           self._log("Chat: " + str(e)[:50])
@@ -274,19 +422,28 @@ class SkyCompanionAgent:
     if shot:
       local = self._do_local_ocr(shot)
       state = self._chat_panel_state_from_lines(local.get("raw_lines", []))
-    if state == "closed":
+    self._log("SendState: " + state)
+    now = time.time()
+    if (
+      state == "closed"
+      and now >= self.chat_panel_assumed_open_until
+      and now - self.last_chat_panel_toggle >= CHAT_PANEL_REOPEN_COOLDOWN
+    ):
       keyboard.press_and_release("c")
       time.sleep(0.25)
+      self.last_chat_panel_toggle = time.time()
+      self.chat_panel_assumed_open_until = self.last_chat_panel_toggle + CHAT_PANEL_OPEN_GRACE
       shot = capture_window()
       if shot:
         local = self._do_local_ocr(shot)
         state = self._chat_panel_state_from_lines(local.get("raw_lines", []))
-    if state in ("chat", "open", "closed"):
+    if state in ("chat", "open"):
       keyboard.press_and_release("enter")
       time.sleep(0.18)
-    keyboard.write(text, delay=0.01)
+    self._paste_or_type(text)
     time.sleep(0.08)
     keyboard.press_and_release("enter")
+    self.chat_panel_assumed_open_until = time.time() + CHAT_PANEL_OPEN_GRACE
 
   def _has_ellipsis_tail(self, txt):
     return bool(re.search(r"(\.{2,}|…+|。{2,}|[，,、·丶]{2,})\s*$", str(txt or "")))
@@ -330,6 +487,12 @@ class SkyCompanionAgent:
       return "聊天跑图都能陪你。"
     if "你在干嘛" in clean:
       return "等你发话呢。"
+    if "哄骗" in clean or "骗" in clean:
+      return "哪有，我这叫战术沟通。"
+    if "锁动作" in clean:
+      return "别急，我先把动作理顺。"
+    if "宣传" in self.personality_prompt or "很会接话" in self.personality_prompt:
+      return "这句我接住了。"
     return ""
 
   def _explicit_search_request(self, txt):
@@ -635,12 +798,12 @@ class SkyCompanionAgent:
     b = self._echo_key(own)
     if len(a) < 2 or len(b) < 2:
       return False
+    if memory and min(len(a), len(b)) < 5:
+      return False
     if a == b:
       return True
     if min(len(a), len(b)) >= 4 and (a in b or b in a):
       return True
-    if memory and min(len(a), len(b)) < 5:
-      return False
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
     sa = set(re.findall(r"[\u4e00-\u9fff]", a))
     sb = set(re.findall(r"[\u4e00-\u9fff]", b))
@@ -691,12 +854,15 @@ class SkyCompanionAgent:
 
   def _is_remark_or_name(self, txt):
     """过滤光遇头顶名称、好友备注、OCR截断的名字。"""
+    raw = str(txt or "").strip()
     clean = self._clean_text(txt)
     if not clean:
       return True
     for name in self._ignore_remarks():
       n = self._clean_text(name)
       if clean == n:
+        if re.search(r"[?？!！]", raw):
+          return False
         return True
       if len(clean) <= len(n) and len(clean) >= 2 and (clean in n or n in clean):
         return True
@@ -868,20 +1034,21 @@ class SkyCompanionAgent:
     # 稍长的句子没有明显UI词时，先当作可能的人话。
     return len(clean) >= 7
 
-  def _select_player_message(self, txt):
+  def _select_player_message(self, txt, already_allowed=False):
     """从OCR多行里只取最像玩家最新发言的一句，避免把整屏说明文字丢给模型。"""
     lines = []
     for line in (txt or "").split("\n"):
       line = line.strip()
       if not line:
         continue
-      line = self._line_for_allowed_user(line)
-      if not line:
-        continue
+      if not already_allowed:
+        line = self._line_for_allowed_user(line)
+        if not line:
+          continue
       clean = self._clean_text(line)
       if not clean:
         continue
-      if self._is_remark_or_name(line) or self._is_self_echo(line):
+      if (not already_allowed and self._is_remark_or_name(line)) or self._is_self_echo(line):
         continue
       if self._is_noise_text(line) or self._looks_like_non_chat_line(line):
         continue
@@ -919,13 +1086,15 @@ class SkyCompanionAgent:
       line = line.strip()
       if not line:
         continue
+      allowed_by_user = False
       line = self._line_for_allowed_user(line)
       if not line:
         continue
+      allowed_by_user = self.require_user_recognition
       clean = self._clean_text(line)
       if not clean:
         continue
-      if self._is_remark_or_name(line):
+      if not allowed_by_user and self._is_remark_or_name(line):
         continue
       if self._is_self_echo(line):
         continue
@@ -960,9 +1129,14 @@ class SkyCompanionAgent:
       if self._is_known_line(line):
         continue
       fresh.append(line)
-    return self._select_player_message("\n".join(fresh))
+    return self._select_player_message("\n".join(fresh), already_allowed=True)
 
   def _conversation_key(self, txt):
+    raw = str(txt or "")
+    clean_raw = self._clean_text(raw)
+    companion = self._clean_text(self.companion_name)
+    if companion and clean_raw == companion and re.search(r"[?？!！]", raw):
+      return companion + "呼唤"
     filtered = self._filter_screen_text(txt)
     lines = [self._clean_text(l) for l in filtered.split("\n") if self._clean_text(l)]
     if lines:
@@ -980,8 +1154,8 @@ class SkyCompanionAgent:
         break
     return re.sub(r"(吗|呢|啊|呀|吧|嘛|哈)+$", "", best)
 
-  def _is_too_fragmentary(self, txt):
-    filtered = self._filter_screen_text(txt)
+  def _is_too_fragmentary(self, txt, already_filtered=False):
+    filtered = txt if already_filtered else self._filter_screen_text(txt)
     lines = [self._clean_text(l) for l in filtered.split("\n") if self._clean_text(l)]
     if not lines:
       return True
@@ -1092,18 +1266,19 @@ class SkyCompanionAgent:
 
   def _local_ocr_regions(self, image):
     w, h = image.size
-    regions = [
-      self._make_region(w, h, (0.02, 0.10, 0.78, 0.86)),
-      self._make_region(w, h, (0.12, 0.08, 0.96, 0.80)),
+    if not self.require_user_recognition:
+      return [
+        self._make_region(w, h, (0.00, 0.08, 0.48, 0.96)),
+      ]
+    # 跟随模式只需要聊天记录左侧和底部输入状态，不再扫整屏三遍。
+    return [
+      self._make_region(w, h, (0.00, 0.00, 0.46, 0.98)),
     ]
-    if self.require_user_recognition:
-      regions.append(self._make_region(w, h, (0.02, 0.72, 0.98, 0.98)))
-    return regions
 
   def _enhance_local_ocr_crop(self, crop):
     crop = crop.convert("RGB")
     resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
-    scale = 2 if max(crop.size) < 1400 else 1
+    scale = 2 if max(crop.size) < 520 else 1
     if scale > 1:
       crop = crop.resize((crop.width * scale, crop.height * scale), resampling)
     gray = ImageOps.grayscale(crop)
@@ -1123,39 +1298,62 @@ class SkyCompanionAgent:
     for crop in crops:
       canvas.paste(crop, (0, y))
       y += crop.height + gap
-    canvas.save(LOCAL_OCR_IMAGE, format="JPEG", quality=86, optimize=True)
-    return str(LOCAL_OCR_IMAGE)
+    target_path = LOCAL_OCR_IMAGE.with_name(f"ocr_work_{os.getpid()}_{self.local_ocr_seq}.jpg")
+    self.local_ocr_seq += 1
+    canvas.save(target_path, format="JPEG", quality=78, optimize=False)
+    now = time.time()
+    if now - self.last_ocr_debug_save > 2.0:
+      try:
+        canvas.save(LOCAL_OCR_IMAGE, format="JPEG", quality=78, optimize=False)
+        self.last_ocr_debug_save = now
+      except Exception:
+        pass
+    if self.local_ocr_seq % 20 == 0:
+      try:
+        old_files = sorted(LOCAL_OCR_IMAGE.parent.glob("ocr_work_*.jpg"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in old_files[30:]:
+          try:
+            old.unlink()
+          except Exception:
+            pass
+      except Exception:
+        pass
+    return str(target_path)
 
   def _do_local_ocr(self, shot):
     if not LOCAL_OCR_SCRIPT.exists():
       return {"available": False, "text": "", "raw_lines": [], "error": "missing windows_ocr.ps1"}
     try:
       target = self._save_local_ocr_target(shot)
-      creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-      completed = subprocess.run(
-        [
-          "powershell.exe",
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-File",
-          str(LOCAL_OCR_SCRIPT),
-          target,
-        ],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=LOCAL_OCR_TIMEOUT,
-        creationflags=creationflags,
-      )
-      if completed.returncode != 0:
-        error = (completed.stderr or completed.stdout or "").strip()
-        return {"available": False, "text": "", "raw_lines": [], "error": error[-160:]}
-      raw_output = (completed.stdout or "{}").strip()
+      raw_output = self._run_local_ocr_server(target)
+      if raw_output is None:
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        completed = subprocess.run(
+          [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(LOCAL_OCR_SCRIPT),
+            target,
+          ],
+          capture_output=True,
+          text=True,
+          encoding="utf-8",
+          errors="replace",
+          timeout=LOCAL_OCR_TIMEOUT,
+          creationflags=creationflags,
+        )
+        if completed.returncode != 0:
+          error = (completed.stderr or completed.stdout or "").strip()
+          return {"available": False, "text": "", "raw_lines": [], "error": error[-160:]}
+        raw_output = (completed.stdout or "{}").strip()
       if not raw_output.startswith("{"):
         raw_output = base64.b64decode(raw_output).decode("utf-8")
       payload = json.loads(raw_output)
+      if payload.get("error"):
+        return {"available": False, "text": "", "raw_lines": [], "error": str(payload.get("error"))[:160]}
       if "line_codes" in payload:
         raw_lines = [
           self._normalize_local_ocr_line("".join(chr(int(code)) for code in line_codes))
@@ -1350,8 +1548,11 @@ class SkyCompanionAgent:
 
   def _send_reply(self, new_msg):
     """对一条确认过的玩家新消息生成回复并打进游戏。"""
-    filtered_msg = self._select_player_message(self._filter_screen_text(new_msg))
-    if not filtered_msg or self._is_too_fragmentary(filtered_msg):
+    # new_msg here has already passed the "speaker is configured user" filter in
+    # _fresh_screen_text. Filtering it again would drop plain text like "你在吗"
+    # because the "-大号" suffix has already been removed.
+    filtered_msg = self._select_player_message(new_msg, already_allowed=True)
+    if not filtered_msg or self._is_too_fragmentary(filtered_msg, already_filtered=True):
       self._log("Skip: " + new_msg.replace("\n", " | ")[:80])
       self._mark_seen(new_msg, replied=False)
       return False
@@ -1365,6 +1566,8 @@ class SkyCompanionAgent:
     if not reply and self._needs_web_search(filtered_msg):
       reply = self._answer_from_search(filtered_msg)
     if not reply and self._must_reply(filtered_msg):
+      reply = self._fallback_reply(filtered_msg)
+    if not reply and ("宣传" in self.personality_prompt or "很会接话" in self.personality_prompt):
       reply = self._fallback_reply(filtered_msg)
     if reply:
       reply = self._polish_reply(reply)
@@ -1429,13 +1632,15 @@ class SkyCompanionAgent:
   def _chat_completion_http(self, prompt, temperature=0.9, max_tokens=60):
     url = chat_url(self.chat.get("base_url", ""))
     model = str(self.chat.get("model", "")).strip()
+    extra_body = self._chat_extra_body()
+    if extra_body and extra_body.get("thinking", {}).get("type") == "enabled":
+      max_tokens = max(max_tokens, 260)
     payload = {
       "model": model,
       "messages": [{"role": "user", "content": prompt}],
       "temperature": temperature,
       "max_tokens": max_tokens,
     }
-    extra_body = self._chat_extra_body()
     if extra_body:
       payload.update(extra_body)
     headers = {
@@ -1591,7 +1796,7 @@ class SkyCompanionAgent:
       time.sleep(1)
     if not window_exists(): self._log("No window"); return
     activate_sky_window(); time.sleep(0.3)
-    self._log("Ready")
+    self._log("Ready " + AGENT_BUILD)
     self.last_time = time.time()
 
     while True:
@@ -1627,10 +1832,18 @@ class SkyCompanionAgent:
         if time.time() < self.next_ocr_at:
           continue
         if not sky_window_foreground():
-          if time.time() - self.last_not_foreground_log > 8:
-            self._log("Watch: 光遇不在前台，暂停识别。")
-            self.last_not_foreground_log = time.time()
-          continue
+          if self.require_user_recognition:
+            if time.time() - self.last_not_foreground_log > 8:
+              self._log("Watch: 光遇不在前台，暂停识别。")
+              self.last_not_foreground_log = time.time()
+            continue
+          activate_sky_window()
+          time.sleep(0.2)
+          if not sky_window_foreground():
+            if time.time() - self.last_not_foreground_log > 8:
+              self._log("Watch: 已尝试拉回光遇，仍不在前台。")
+              self.last_not_foreground_log = time.time()
+            continue
         shot = capture_window()
         if not shot: continue
         if not self._changed(shot): continue
@@ -1678,7 +1891,7 @@ class SkyCompanionAgent:
         if self._scanned_recently(new_msg):
           continue
 
-        if self._is_too_fragmentary(new_msg):
+        if self._is_too_fragmentary(new_msg, already_filtered=True):
           self._log("Skip: " + new_msg.replace("\n", " | ")[:80])
           self._mark_seen(new_msg, replied=False)
           continue
